@@ -5,6 +5,34 @@ import dayjs from "dayjs";
 import util from "util";
 import { recordChannelGapFailure, isChannelCircuitBroken } from "@utils/channelGapBreaker";
 
+const LOGGER_STATE_KEY = "__telebox_logger_console_state__";
+
+type ConsoleState = {
+  debug: typeof console.debug;
+  log: typeof console.log;
+  info: typeof console.info;
+  warn: typeof console.warn;
+  error: typeof console.error;
+  overridden: boolean;
+};
+
+function getConsoleState(): ConsoleState {
+  const globalRecord = globalThis as typeof globalThis & {
+    [LOGGER_STATE_KEY]?: ConsoleState;
+  };
+  if (!globalRecord[LOGGER_STATE_KEY]) {
+    globalRecord[LOGGER_STATE_KEY] = {
+      debug: console.debug.bind(console),
+      log: console.log.bind(console),
+      info: console.info.bind(console),
+      warn: console.warn.bind(console),
+      error: console.error.bind(console),
+      overridden: false,
+    };
+  }
+  return globalRecord[LOGGER_STATE_KEY]!;
+}
+
 export enum LogLevel {
   DEBUG = 0,
   INFO = 1,
@@ -43,11 +71,11 @@ class Logger {
   private static downgradeLastLogged: Map<string, number> = new Map();
   private static readonly DOWNGRADE_LOG_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
-  private static originalDebug = console.debug;
-  private static originalLog = console.log;
-  private static originalInfo = console.info;
-  private static originalWarn = console.warn;
-  private static originalError = console.error;
+  private static originalDebug = getConsoleState().debug;
+  private static originalLog = getConsoleState().log;
+  private static originalInfo = getConsoleState().info;
+  private static originalWarn = getConsoleState().warn;
+  private static originalError = getConsoleState().error;
   private static isOverridden = false;
 
   constructor(context: Record<string, any> = {}) {
@@ -216,6 +244,14 @@ class Logger {
   }
 
   private overrideConsole() {
+    const state = getConsoleState();
+    Logger.originalDebug = state.debug;
+    Logger.originalLog = state.log;
+    Logger.originalInfo = state.info;
+    Logger.originalWarn = state.warn;
+    Logger.originalError = state.error;
+    Logger.isOverridden = state.overridden;
+
     if (Logger.isOverridden) return;
 
     console.debug = (...args: any[]) => {
@@ -303,6 +339,7 @@ class Logger {
     };
     
     Logger.isOverridden = true;
+    state.overridden = true;
   }
 
   public async setLevel(level: LogLevel) {

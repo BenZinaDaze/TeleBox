@@ -49,6 +49,8 @@ const CACHE_PURGE_EXCLUDE = new Set<string>([
   path.resolve(PROJECT_ROOT, "src/utils/cronManager.js"),
   path.resolve(PROJECT_ROOT, "src/utils/runtimeManager.ts"),
   path.resolve(PROJECT_ROOT, "src/utils/runtimeManager.js"),
+  path.resolve(PROJECT_ROOT, "src/utils/logger.ts"),
+  path.resolve(PROJECT_ROOT, "src/utils/logger.js"),
 ]);
 
 let prefixes = [".", "。", "$"];
