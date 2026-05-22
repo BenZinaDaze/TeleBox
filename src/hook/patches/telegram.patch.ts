@@ -1,7 +1,9 @@
 import { Api } from "teleproto/tl";
-import { sleep } from "teleproto/Helpers";
+import * as TeleprotoHelpers from "teleproto/Helpers";
 
 const { HTMLParser } = require("teleproto/extensions/html");
+const mutableTeleprotoHelpers = require("teleproto/Helpers") as any;
+const MAX_SAFE_TIMEOUT_MS = 2147483647;
 
 const ENTITY_SENTINELS = {
   lt: "\uE000",
@@ -36,11 +38,26 @@ HTMLParser.parse = function patchedHtmlParse(html: string) {
   return [restoreHtmlEntities(text), entities];
 };
 
+const originalSleep = TeleprotoHelpers.sleep.bind(TeleprotoHelpers);
+
+function clampTimeoutMs(ms: number): number {
+  if (!Number.isFinite(ms)) return 0;
+  if (ms <= 0) return 0;
+  return Math.min(ms, MAX_SAFE_TIMEOUT_MS);
+}
+
+mutableTeleprotoHelpers.sleep = function patchedSleep(
+  ms: number,
+  isUnref = false
+) {
+  return originalSleep(clampTimeoutMs(ms), isUnref);
+};
+
 Api.Message.prototype.deleteWithDelay = async function (
   delay: number,
   shouldThrowError: boolean
 ) {
-  await sleep(delay);
+  await TeleprotoHelpers.sleep(delay);
   try {
     return this.delete();
   } catch (e) {
