@@ -806,7 +806,7 @@ class DsPlugin extends Plugin {
     `<code>${mainPrefix}ds provider list</code> - 查看 Provider、能力和当前路由\n` +
     `<code>${mainPrefix}ds provider set text deepseek</code> - 设置文本路由 Provider\n` +
     `<code>${mainPrefix}ds provider set vision siliconflow</code> - 设置视觉路由 Provider\n` +
-    `<code>${mainPrefix}ds key set siliconflow sk-xxx</code> - 设置 Provider API Key\n` +
+    `<code>${mainPrefix}ds key set &lt;provider&gt; &lt;apiKey&gt;</code> - 按 Provider 名设置 API Key\n` +
     `<code>${mainPrefix}ds model set text deepseek-v4-flash</code> - 设置文本模型\n` +
     `<code>${mainPrefix}ds model set vision Qwen/Qwen3-VL-32B-Instruct</code> - 设置视觉模型\n` +
     `<code>${mainPrefix}ds prompt show|set|clear</code> - 管理全局 System Prompt\n` +
@@ -1088,7 +1088,7 @@ class DsPlugin extends Plugin {
     if (subCommand !== "set") {
       await safeEditMessage(
         msg,
-        `用法：<code>${escapeHtml(mainPrefix)}ds key set siliconflow sk-xxx</code>`,
+        `用法：<code>${escapeHtml(mainPrefix)}ds key set &lt;provider&gt; &lt;apiKey&gt;</code>`,
         "html",
       );
       return;
@@ -1100,7 +1100,7 @@ class DsPlugin extends Plugin {
     if (!providerId || !apiKey) {
       await safeEditMessage(
         msg,
-        `用法：<code>${escapeHtml(mainPrefix)}ds key set siliconflow sk-xxx</code>`,
+        `用法：<code>${escapeHtml(mainPrefix)}ds key set &lt;provider&gt; &lt;apiKey&gt;</code>`,
         "html",
       );
       return;
