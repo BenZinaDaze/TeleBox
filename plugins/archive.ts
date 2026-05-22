@@ -577,8 +577,8 @@ class ArchiveDB {
 
   public isChatBlacklisted(chatId: string): boolean {
     const row = this.db
-      .prepare<[string], { exists: number }>(`
-        SELECT 1 AS exists
+      .prepare<[string], { found: number }>(`
+        SELECT 1 AS found
         FROM archive_blacklist
         WHERE chat_id = ?
         LIMIT 1

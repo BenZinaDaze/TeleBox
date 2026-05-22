@@ -86,11 +86,9 @@ module.exports = {
       },
       out_file: path.join(logDir, 'telebox-out.log'),
       error_file: path.join(logDir, 'telebox-error.log'),
-      log_file: path.join(logDir, 'telebox-combined.log'),
-      merge_logs: true,
-      combine_logs: true,
-      time: true,
-      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: false,
+      combine_logs: false,
+      time: false,
       autorestart: true,
       watch: false,
       max_restarts: 10,
@@ -98,4 +96,3 @@ module.exports = {
     },
   ],
 };
-
