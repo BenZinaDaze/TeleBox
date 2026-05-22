@@ -1459,7 +1459,6 @@ class ArchivePlugin extends Plugin {
           try {
             for await (const message of client.iterMessages(dialog.inputEntity || dialog.entity, {
               reverse: true,
-              waitTime: BACKFILL_WAIT_TIME_SECONDS,
             })) {
               throwIfAborted(signal);
               const messageTs = getDateNumber(message.date);
