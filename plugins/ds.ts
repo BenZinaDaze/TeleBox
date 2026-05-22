@@ -1,59 +1,136 @@
 import axios from "axios";
 import path from "path";
+import sharp from "sharp";
 import { JSONFilePreset } from "lowdb/node";
-import { Api, TelegramClient } from "teleproto";
-import { NewMessage, NewMessageEvent } from "teleproto/events";
-import { Plugin, type PluginRuntimeContext } from "@utils/pluginBase";
+import { Api } from "teleproto";
+import { Plugin } from "@utils/pluginBase";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
 import { getPrefixes } from "@utils/pluginManager";
 import { safeGetMe } from "@utils/authGuards";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
-import type { GenerationContext } from "@utils/generationContext";
 import { TelegramFormatter } from "@utils/telegramFormatter";
+
+type RouteKind = "text" | "vision";
 
 type ProviderConfig = {
   apiKey: string;
   baseURL: string;
-  model: string;
+  textModel: string;
+  visionModel: string;
+  supportsText: boolean;
+  supportsVision: boolean;
 };
 
 type DsConfig = {
-  currentProvider: string;
+  currentTextProvider: string;
+  currentVisionProvider: string;
   systemPrompt: string;
   providers: Record<string, ProviderConfig>;
 };
 
+type ChatContentPart =
+  | { type: "text"; text: string }
+  | {
+      type: "image_url";
+      image_url: {
+        url: string;
+        detail?: "auto" | "low" | "high";
+      };
+    };
+
 type ChatMessage = {
   role: "system" | "user";
-  content: string;
+  content: string | ChatContentPart[];
 };
 
+type ProviderDefinition = {
+  id: string;
+  displayName: string;
+  defaultBaseURL: string;
+  defaultTextModel: string;
+  defaultVisionModel: string;
+  supportsText: boolean;
+  supportsVision: boolean;
+  supportsStream: boolean;
+};
+
+type PreparedImage = {
+  buffer: Buffer;
+  mimeType: "image/jpeg" | "image/png" | "image/webp";
+  originalBytes: number;
+  finalBytes: number;
+};
+
+type AskContext =
+  | {
+      route: "text";
+      question: string;
+      repliedText?: string;
+    }
+  | {
+      route: "vision";
+      question: string;
+      caption: string;
+      image: PreparedImage;
+    };
+
 const PLUGIN_NAME = "ds";
-const DEFAULT_PROVIDER = "deepseek";
-const DEFAULT_BASE_URL = "https://api.deepseek.com";
-const DEFAULT_MODEL = "deepseek-v4-flash";
-const API_KEY_TIMEOUT_MS = 60_000;
-const STREAM_EDIT_INTERVAL_MS = 900;
+const DEFAULT_TEXT_PROVIDER = "deepseek";
+const DEFAULT_VISION_PROVIDER = "siliconflow";
 const TELEGRAM_TEXT_LIMIT = 3500;
+const STREAM_EDIT_INTERVAL_MS = 900;
+const MAX_REFERENCE_BYTES = 8 * 1024 * 1024;
+const TARGET_REFERENCE_BYTES = 4 * 1024 * 1024;
+const MAX_REFERENCE_DIMENSION = 2048;
+const MAX_CAPTION_CHARS = 1000;
+const MAX_QUESTION_CHARS = 2000;
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0] || ".";
 const CONFIG_PATH = path.join(
   createDirectoryInAssets(PLUGIN_NAME),
-  "config.json"
+  "config.json",
 );
 
-const DEFAULT_PROVIDER_CONFIG: ProviderConfig = {
-  apiKey: "",
-  baseURL: DEFAULT_BASE_URL,
-  model: DEFAULT_MODEL,
+const PROVIDERS: Record<string, ProviderDefinition> = {
+  deepseek: {
+    id: "deepseek",
+    displayName: "DeepSeek",
+    defaultBaseURL: "https://api.deepseek.com",
+    defaultTextModel: "deepseek-v4-flash",
+    defaultVisionModel: "",
+    supportsText: true,
+    supportsVision: false,
+    supportsStream: true,
+  },
+  siliconflow: {
+    id: "siliconflow",
+    displayName: "SiliconFlow",
+    defaultBaseURL: "https://api.siliconflow.cn/v1",
+    defaultTextModel: "",
+    defaultVisionModel: "Qwen/Qwen3-VL-32B-Instruct",
+    supportsText: true,
+    supportsVision: true,
+    supportsStream: true,
+  },
 };
 
 const DEFAULT_CONFIG: DsConfig = {
-  currentProvider: DEFAULT_PROVIDER,
+  currentTextProvider: DEFAULT_TEXT_PROVIDER,
+  currentVisionProvider: DEFAULT_VISION_PROVIDER,
   systemPrompt: "",
-  providers: {
-    [DEFAULT_PROVIDER]: { ...DEFAULT_PROVIDER_CONFIG },
-  },
+  providers: Object.fromEntries(
+    Object.values(PROVIDERS).map((provider) => [
+      provider.id,
+      {
+        apiKey: "",
+        baseURL: provider.defaultBaseURL,
+        textModel: provider.defaultTextModel,
+        visionModel: provider.defaultVisionModel,
+        supportsText: provider.supportsText,
+        supportsVision: provider.supportsVision,
+      },
+    ]),
+  ),
 };
 
 function escapeHtml(text: string): string {
@@ -65,42 +142,36 @@ function escapeHtml(text: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function normalizeProviderConfig(raw?: Partial<ProviderConfig> | null): ProviderConfig {
-  return {
-    apiKey: raw?.apiKey?.trim() || "",
-    baseURL: raw?.baseURL?.trim() || DEFAULT_PROVIDER_CONFIG.baseURL,
-    model: raw?.model?.trim() || DEFAULT_PROVIDER_CONFIG.model,
-  };
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function normalizeConfig(raw?: Partial<DsConfig> | null): DsConfig {
-  const providers = typeof raw?.providers === "object" && raw?.providers
-    ? Object.fromEntries(
-      Object.entries(raw.providers)
-        .map(([name, config]) => [name.trim().toLowerCase(), normalizeProviderConfig(config)])
-        .filter(([name]) => !!name)
-    )
-    : {};
-
-  const currentProvider = raw?.currentProvider?.trim().toLowerCase() || DEFAULT_PROVIDER;
-
-  if (!providers[currentProvider]) {
-    providers[currentProvider] = { ...DEFAULT_PROVIDER_CONFIG };
+function getComparableId(value: unknown): string | undefined {
+  if (value == null) return undefined;
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "bigint"
+  ) {
+    return String(value);
   }
+  if (typeof value !== "object") return undefined;
 
-  if (!providers[DEFAULT_PROVIDER]) {
-    providers[DEFAULT_PROVIDER] = { ...DEFAULT_PROVIDER_CONFIG };
+  const record = value as Record<string, unknown>;
+  for (const key of ["userId", "chatId", "channelId", "senderId", "id"]) {
+    const nested = getComparableId(record[key]);
+    if (nested) return nested;
   }
-
-  return {
-    currentProvider,
-    systemPrompt: raw?.systemPrompt?.trim() || "",
-    providers,
-  };
+  return undefined;
 }
 
-function getCurrentProviderConfig(config: DsConfig): ProviderConfig {
-  return normalizeProviderConfig(config.providers[config.currentProvider]);
+function getMessageSenderId(msg: Api.Message): string | undefined {
+  return (
+    getComparableId((msg as Api.Message & { senderId?: unknown }).senderId) ||
+    getComparableId((msg as Api.Message & { fromId?: unknown }).fromId)
+  );
 }
 
 function getMatchedPrefix(text: string): string {
@@ -116,6 +187,11 @@ function getCommandPayload(text: string): string {
   return rest.slice(firstSpace + 1).trim();
 }
 
+function truncateForTelegram(text: string): string {
+  if (text.length <= TELEGRAM_TEXT_LIMIT) return text;
+  return `${text.slice(0, TELEGRAM_TEXT_LIMIT)}\n\n…(输出过长，已截断)`;
+}
+
 function maskApiKey(apiKey: string): string {
   const value = apiKey.trim();
   if (!value) return "未配置";
@@ -125,61 +201,125 @@ function maskApiKey(apiKey: string): string {
   return `${value.slice(0, 3)}****${value.slice(-4)}`;
 }
 
-function getComparableId(value: unknown): string | undefined {
-  if (value == null) return undefined;
-  if (typeof value === "string" || typeof value === "number" || typeof value === "bigint") {
-    return String(value);
-  }
-  if (typeof value !== "object") return undefined;
-
-  const record = value as Record<string, unknown>;
-  for (const key of ["userId", "chatId", "channelId", "senderId", "id"]) {
-    const nested = getComparableId(record[key]);
-    if (nested) return nested;
-  }
-
-  return undefined;
-}
-
-function getMessageSenderId(msg: Api.Message): string | undefined {
-  return getComparableId((msg as Api.Message & { senderId?: unknown }).senderId)
-    || getComparableId((msg as Api.Message & { fromId?: unknown }).fromId);
-}
-
-function getMessageChatId(msg: Api.Message): string | undefined {
-  return getComparableId((msg as Api.Message & { chatId?: unknown }).chatId)
-    || getComparableId((msg as Api.Message & { peerId?: unknown }).peerId);
-}
-
-function getReplyToMsgId(msg: Api.Message): number | undefined {
-  const replyTo = (msg as Api.Message & {
-    replyTo?: { replyToMsgId?: number };
-    replyToMsgId?: number;
-  }).replyTo;
-  return replyTo?.replyToMsgId ?? (msg as Api.Message & { replyToMsgId?: number }).replyToMsgId;
-}
-
-function truncateForTelegram(text: string): string {
-  if (text.length <= TELEGRAM_TEXT_LIMIT) return text;
-  return `${text.slice(0, TELEGRAM_TEXT_LIMIT)}\n\n…(输出过长，已截断)`;
-}
-
 function formatAiOutput(content: string): string {
   const body = content.trim() || "(无内容)";
-  const truncatedBody = truncateForTelegram(body);
-  return TelegramFormatter.markdownToHtml(truncatedBody);
+  return TelegramFormatter.markdownToHtml(truncateForTelegram(body));
 }
 
-function formatQuestionAndAnswer(question: string, model: string, answer: string): string {
-  const safeQuestion = escapeHtml(question.trim());
-  const renderedAnswer = formatAiOutput(answer);
-  return `${safeQuestion}\n\n──────────\n\n🤖 <b>DeepSeek · ${escapeHtml(model)}</b>\n\n${renderedAnswer}`;
+function renderAnswer(params: {
+  providerName: string;
+  model: string;
+  answer: string;
+  question?: string;
+}): string {
+  const header = `🤖 <b>${escapeHtml(params.providerName)} · ${escapeHtml(params.model)}</b>`;
+  const answer = formatAiOutput(params.answer);
+  const question = params.question?.trim() || "";
+  if (question) {
+    return `${escapeHtml(question)}\n\n──────────\n\n${header}\n\n${answer}`;
+  }
+  return `${header}\n\n${answer}`;
+}
+
+function routeLabel(route: RouteKind): string {
+  return route === "text" ? "Text Route" : "Vision Route";
+}
+
+function getRouteProviderId(config: DsConfig, route: RouteKind): string {
+  return route === "text" ? config.currentTextProvider : config.currentVisionProvider;
+}
+
+function getRouteModel(config: DsConfig, route: RouteKind, providerId: string): string {
+  const provider = config.providers[providerId];
+  if (!provider) return "";
+  return route === "text" ? provider.textModel : provider.visionModel;
+}
+
+function getRouteFixCommand(config: DsConfig, route: RouteKind): string {
+  const providerId = getRouteProviderId(config, route);
+  return `${mainPrefix}ds key set ${providerId} <apiKey>`;
+}
+
+function normalizeProviderConfig(
+  name: string,
+  raw?: Partial<ProviderConfig> | null,
+): ProviderConfig {
+  const provider = PROVIDERS[name];
+  const base = provider
+    ? {
+        apiKey: "",
+        baseURL: provider.defaultBaseURL,
+        textModel: provider.defaultTextModel,
+        visionModel: provider.defaultVisionModel,
+        supportsText: provider.supportsText,
+        supportsVision: provider.supportsVision,
+      }
+    : {
+        apiKey: "",
+        baseURL: "",
+        textModel: "",
+        visionModel: "",
+        supportsText: false,
+        supportsVision: false,
+      };
+
+  const legacyModel =
+    typeof (raw as { model?: unknown } | undefined)?.model === "string"
+      ? String((raw as { model?: string }).model).trim()
+      : "";
+
+  return {
+    apiKey: raw?.apiKey?.trim() || base.apiKey,
+    baseURL: raw?.baseURL?.trim() || base.baseURL,
+    textModel: raw?.textModel?.trim() || legacyModel || base.textModel,
+    visionModel: raw?.visionModel?.trim() || base.visionModel,
+    supportsText: provider ? provider.supportsText : !!raw?.supportsText,
+    supportsVision: provider ? provider.supportsVision : !!raw?.supportsVision,
+  };
+}
+
+function normalizeConfig(raw?: Partial<DsConfig> | null): DsConfig {
+  const rawRecord = (raw || {}) as Partial<DsConfig> & {
+    providers?: Record<string, Partial<ProviderConfig>>;
+  };
+
+  const providers = Object.fromEntries(
+    Object.keys(PROVIDERS).map((name) => [
+      name,
+      normalizeProviderConfig(name, rawRecord.providers?.[name]),
+    ]),
+  );
+
+  const currentTextProvider =
+    rawRecord.currentTextProvider?.trim().toLowerCase() ||
+    DEFAULT_TEXT_PROVIDER;
+  const currentVisionProvider =
+    rawRecord.currentVisionProvider?.trim().toLowerCase() ||
+    DEFAULT_VISION_PROVIDER;
+
+  return {
+    currentTextProvider: PROVIDERS[currentTextProvider]
+      ? currentTextProvider
+      : DEFAULT_TEXT_PROVIDER,
+    currentVisionProvider: PROVIDERS[currentVisionProvider]?.supportsVision
+      ? currentVisionProvider
+      : DEFAULT_VISION_PROVIDER,
+    systemPrompt: rawRecord.systemPrompt?.trim() || "",
+    providers,
+  };
+}
+
+function takeWithMarker(text: string, maxChars: number, label: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  if (trimmed.length <= maxChars) return trimmed;
+  return `[${label}已截断]\n${trimmed.slice(0, maxChars)}`;
 }
 
 async function safeEditMessage(
   msg: Api.Message,
   text: string,
-  parseMode?: "html"
+  parseMode?: "html",
 ): Promise<void> {
   if (parseMode) {
     await msg.edit({ text, parseMode }).catch(() => undefined);
@@ -201,6 +341,257 @@ async function ensureSelfInvocation(msg: Api.Message): Promise<boolean> {
     return false;
   }
 }
+
+function getProviderOrThrow(providerId: string): ProviderDefinition {
+  const provider = PROVIDERS[providerId];
+  if (!provider) {
+    throw new Error(`Provider ${providerId} 尚未实现。`);
+  }
+  return provider;
+}
+
+function getMessageImageMimeType(message: Api.Message): string {
+  const documentMime = (message.media as { document?: { mimeType?: unknown } } | undefined)
+    ?.document?.mimeType;
+  if (typeof documentMime === "string" && documentMime.startsWith("image/")) {
+    return documentMime;
+  }
+  if ((message.media as { photo?: unknown } | undefined)?.photo) {
+    return "image/jpeg";
+  }
+  return "image/png";
+}
+
+function isSupportedMimeType(mimeType: string): mimeType is PreparedImage["mimeType"] {
+  return (
+    mimeType === "image/jpeg" ||
+    mimeType === "image/png" ||
+    mimeType === "image/webp"
+  );
+}
+
+async function getReplyImageBuffer(msg: Api.Message): Promise<Buffer | null> {
+  const replyMsg = await safeGetReplyMessage(msg);
+  if (!replyMsg?.media) return null;
+  if (!msg.client) {
+    throw new Error("无法获取 Telegram 客户端实例");
+  }
+
+  const client = msg.client as {
+    downloadMedia: (
+      media: unknown,
+      options?: Record<string, unknown>,
+    ) => Promise<unknown>;
+  };
+  const mediaData = await client.downloadMedia(replyMsg.media, { workers: 1 });
+  if (Buffer.isBuffer(mediaData)) {
+    return mediaData.length ? mediaData : null;
+  }
+  if (mediaData && typeof (mediaData as { read?: unknown }).read === "function") {
+    const chunks: Buffer[] = [];
+    for await (const chunk of mediaData as AsyncIterable<Uint8Array>) {
+      chunks.push(Buffer.from(chunk));
+    }
+    const buffer = Buffer.concat(chunks);
+    return buffer.length ? buffer : null;
+  }
+  return null;
+}
+
+async function prepareReplyImage(msg: Api.Message): Promise<PreparedImage | null> {
+  const replyMsg = await safeGetReplyMessage(msg);
+  if (!replyMsg?.media) return null;
+
+  if ((replyMsg as Api.Message & { groupedId?: unknown }).groupedId) {
+    throw new Error(
+      `当前仅支持单张静态图片。请回复单张静态图片后执行 <code>${escapeHtml(mainPrefix)}ds</code> 或 <code>${escapeHtml(mainPrefix)}ds 这是什么</code>。`,
+    );
+  }
+
+  const sourceBuffer = await getReplyImageBuffer(msg);
+  if (!sourceBuffer?.length) {
+    throw new Error("未能获取图片数据。请确认被回复消息确实包含单张静态图片。");
+  }
+
+  const originalMime = getMessageImageMimeType(replyMsg);
+  let transformer: sharp.Sharp;
+  try {
+    transformer = sharp(sourceBuffer, { animated: true, failOn: "warning" });
+  } catch {
+    throw new Error(
+      `当前仅支持单张静态图片。请回复单张静态图片后执行 <code>${escapeHtml(mainPrefix)}ds</code> 或 <code>${escapeHtml(mainPrefix)}ds 这是什么</code>。`,
+    );
+  }
+
+  let metadata: sharp.Metadata;
+  try {
+    metadata = await transformer.metadata();
+  } catch {
+    throw new Error("无法读取图片信息，请换一张静态 JPG/PNG/WebP 图片。");
+  }
+
+  if ((metadata.pages || 1) > 1) {
+    throw new Error(
+      `当前仅支持单张静态图片。请回复单张静态图片后执行 <code>${escapeHtml(mainPrefix)}ds</code> 或 <code>${escapeHtml(mainPrefix)}ds 这是什么</code>。`,
+    );
+  }
+
+  const normalizedMime: PreparedImage["mimeType"] = isSupportedMimeType(originalMime)
+    ? originalMime
+    : "image/jpeg";
+
+  let pipeline = sharp(sourceBuffer)
+    .rotate()
+    .resize({
+      width: MAX_REFERENCE_DIMENSION,
+      height: MAX_REFERENCE_DIMENSION,
+      fit: "inside",
+      withoutEnlargement: true,
+    });
+
+  if (normalizedMime === "image/png") {
+    pipeline = pipeline.png({ compressionLevel: 9, palette: true });
+  } else if (normalizedMime === "image/webp") {
+    pipeline = pipeline.webp({ quality: 85 });
+  } else {
+    pipeline = pipeline.jpeg({ quality: 85, mozjpeg: true });
+  }
+
+  let output = await pipeline.toBuffer();
+  let finalMime = normalizedMime;
+
+  if (output.length > TARGET_REFERENCE_BYTES) {
+    output = await sharp(output)
+      .rotate()
+      .resize({
+        width: 1536,
+        height: 1536,
+        fit: "inside",
+        withoutEnlargement: true,
+      })
+      .jpeg({ quality: 72, mozjpeg: true })
+      .toBuffer();
+    finalMime = "image/jpeg";
+  }
+
+  if (output.length > MAX_REFERENCE_BYTES) {
+    throw new Error(
+      `图片处理后仍然过大（${formatBytes(output.length)}），请换一张更小的静态图片。`,
+    );
+  }
+
+  return {
+    buffer: output,
+    mimeType: finalMime,
+    originalBytes: sourceBuffer.length,
+    finalBytes: output.length,
+  };
+}
+
+class OpenAICompatProvider {
+  readonly definition: ProviderDefinition;
+
+  constructor(definition: ProviderDefinition) {
+    this.definition = definition;
+  }
+
+  private getEndpoint(baseURL: string): string {
+    return `${baseURL.replace(/\/+$/, "")}/chat/completions`;
+  }
+
+  async complete(
+    route: RouteKind,
+    providerConfig: ProviderConfig,
+    messages: ChatMessage[],
+  ): Promise<string> {
+    const response = await axios.post(
+      this.getEndpoint(providerConfig.baseURL),
+      {
+        model: route === "text" ? providerConfig.textModel : providerConfig.visionModel,
+        messages,
+        stream: false,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${providerConfig.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 60_000,
+      },
+    );
+
+    const content = response.data?.choices?.[0]?.message?.content;
+    if (content.trim()) return content;
+    throw new Error(route === "vision" ? "视觉接口返回为空" : "接口返回为空");
+  }
+
+  async stream(
+    route: RouteKind,
+    providerConfig: ProviderConfig,
+    messages: ChatMessage[],
+    onDelta: (text: string) => void,
+  ): Promise<void> {
+    const response = await axios.post(
+      this.getEndpoint(providerConfig.baseURL),
+      {
+        model: route === "text" ? providerConfig.textModel : providerConfig.visionModel,
+        messages,
+        stream: true,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${providerConfig.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        responseType: "stream",
+        timeout: 120_000,
+      },
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      let buffer = "";
+      const stream: NodeJS.ReadableStream = response.data;
+
+      const processLine = (line: string): void => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) return;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === "[DONE]") return;
+
+        try {
+          const parsed = JSON.parse(payload);
+          const choice = parsed?.choices?.[0];
+          const delta = choice?.delta?.content;
+          if (delta) onDelta(delta);
+        } catch {
+          // ignore partial JSON chunks
+        }
+      };
+
+      stream.on("data", (chunk: Buffer | string) => {
+        buffer += chunk.toString();
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          processLine(line);
+          newlineIndex = buffer.indexOf("\n");
+        }
+      });
+
+      stream.on("end", () => {
+        if (buffer.trim()) processLine(buffer);
+        resolve();
+      });
+
+      stream.on("error", reject);
+    });
+  }
+}
+
+const providerClients: Record<string, OpenAICompatProvider> = Object.fromEntries(
+  Object.values(PROVIDERS).map((provider) => [provider.id, new OpenAICompatProvider(provider)]),
+);
 
 class DsConfigStore {
   private readonly dbPromise = JSONFilePreset<DsConfig>(CONFIG_PATH, DEFAULT_CONFIG);
@@ -225,12 +616,15 @@ class DsConfigStore {
 
   async setProviderConfig(
     providerName: string,
-    patch: Partial<ProviderConfig>
+    patch: Partial<ProviderConfig>,
   ): Promise<DsConfig> {
     const db = await this.dbPromise;
     const normalized = normalizeConfig(db.data);
     const providerKey = providerName.trim().toLowerCase();
-    normalized.providers[providerKey] = normalizeProviderConfig({
+    if (!PROVIDERS[providerKey]) {
+      throw new Error(`Provider <code>${escapeHtml(providerKey)}</code> 尚未实现。`);
+    }
+    normalized.providers[providerKey] = normalizeProviderConfig(providerKey, {
       ...normalized.providers[providerKey],
       ...patch,
     });
@@ -240,265 +634,182 @@ class DsConfigStore {
   }
 }
 
-async function waitForOwnerReply(params: {
-  client: TelegramClient;
-  promptMessage: Api.Message;
-  lifecycle: GenerationContext;
-  ownerId?: string;
-  timeoutMs: number;
-}): Promise<Api.Message> {
-  const { client, promptMessage, lifecycle, ownerId, timeoutMs } = params;
-  const expectedChatId = getMessageChatId(promptMessage);
-  const expectedReplyId = promptMessage.id;
+function mapProviderError(error: unknown, route: RouteKind, routeModel: string): string {
+  if (!axios.isAxiosError(error)) {
+    return error instanceof Error ? error.message : String(error);
+  }
 
-  return lifecycle.runTask(
-    async (signal) =>
-      await new Promise<Api.Message>((resolve, reject) => {
-        let settled = false;
-        const eventBuilder = new NewMessage({});
-        let cleanup: (() => Promise<void>) | null = null;
+  const status = error.response?.status;
+  const detail =
+    typeof error.response?.data === "string"
+      ? error.response.data.slice(0, 300)
+      : JSON.stringify(error.response?.data || {}).slice(0, 300);
+  const normalizedDetail = detail.toLowerCase();
 
-        const finish = async (cb: () => void): Promise<void> => {
-          if (settled) return;
-          settled = true;
-          signal.removeEventListener("abort", onAbort);
-          if (cleanup) {
-            await cleanup().catch(() => undefined);
-            cleanup = null;
-          }
-          cb();
-        };
-
-        const onAbort = (): void => {
-          void finish(() => reject(new Error("等待设置 API Key 已取消")));
-        };
-
-        const handler = (event: NewMessageEvent): void => {
-          const candidate = event.message;
-          if (!candidate) return;
-          if (ownerId && getMessageSenderId(candidate) !== ownerId) return;
-          if (getMessageChatId(candidate) !== expectedChatId) return;
-          if (getReplyToMsgId(candidate) !== expectedReplyId) return;
-          void finish(() => resolve(candidate));
-        };
-
-        client.addEventHandler(handler, eventBuilder);
-        const disposeListener = lifecycle.trackDisposable(
-          () => client.removeEventHandler(handler, eventBuilder),
-          { label: "ds:wait-owner-reply", kind: "handler" }
-        );
-
-        const timeout = lifecycle.setTimeout(() => {
-          void finish(() => reject(new Error("等待设置 API Key 超时，请重新执行命令。")));
-        }, timeoutMs, { label: "ds:wait-owner-reply-timeout" });
-
-        cleanup = async () => {
-          clearTimeout(timeout);
-          await Promise.resolve(disposeListener()).catch(() => undefined);
-        };
-
-        signal.addEventListener("abort", onAbort, { once: true });
-        if (signal.aborted) {
-          onAbort();
-        }
-      }),
-    { label: "ds:wait-owner-reply", kind: "conversation" }
-  );
+  if (error.code === "ECONNABORTED") {
+    return route === "vision" ? "视觉请求超时，请稍后重试。" : "请求超时，请稍后重试。";
+  }
+  if (status === 401 || status === 403) {
+    return "鉴权失败，请检查 API Key 配置。";
+  }
+  if (status === 429) {
+    return "请求过于频繁，请稍后再试。";
+  }
+  if (status === 408 || status === 504) {
+    return route === "vision" ? "视觉请求超时，请稍后重试。" : "请求超时，请稍后重试。";
+  }
+  if (
+    route === "vision" &&
+    status === 400 &&
+    (
+      normalizedDetail.includes("image") ||
+      normalizedDetail.includes("vision") ||
+      normalizedDetail.includes("multimodal") ||
+      normalizedDetail.includes("content")
+    )
+  ) {
+    return `当前视觉模型 <code>${escapeHtml(routeModel)}</code> 可能不支持图像输入，请更换 <code>visionModel</code>。`;
+  }
+  if (status && status >= 400 && status < 500) {
+    return detail || "请求参数无效。";
+  }
+  return detail || "远端服务请求失败。";
 }
 
-async function promptForApiKey(params: {
-  commandMessage: Api.Message;
-  lifecycle: GenerationContext;
-  ownerId?: string;
-}): Promise<string> {
-  const { commandMessage, lifecycle, ownerId } = params;
-
-  await safeEditMessage(
-    commandMessage,
-    [
-      "🔐 当前 Provider 缺少 API Key。",
-      "",
-      "请直接回复这条消息发送你的 DeepSeek API Key。",
-      `超时时间：${Math.floor(API_KEY_TIMEOUT_MS / 1000)} 秒`,
-    ].join("\n")
-  );
-
-  const reply = await waitForOwnerReply({
-    client: commandMessage.client!,
-    promptMessage: commandMessage,
-    lifecycle,
-    ownerId,
-    timeoutMs: API_KEY_TIMEOUT_MS,
-  });
-
-  const value = (reply.message || "").trim();
-  if (!value) {
-    throw new Error("收到的 API Key 为空，请重新执行命令。");
-  }
-  return value;
-}
-
-class DeepSeekProvider {
-  readonly id = DEFAULT_PROVIDER;
-  readonly displayName = "DeepSeek";
-
-  private getEndpoint(baseURL: string): string {
-    return `${baseURL.replace(/\/+$/, "")}/chat/completions`;
-  }
-
-  async complete(providerConfig: ProviderConfig, messages: ChatMessage[]): Promise<string> {
-    const response = await axios.post(
-      this.getEndpoint(providerConfig.baseURL || DEFAULT_BASE_URL),
-      {
-        model: providerConfig.model || DEFAULT_MODEL,
-        messages,
-        stream: false,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${providerConfig.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 60_000,
-      }
-    );
-
-    const content = response.data?.choices?.[0]?.message?.content;
-    if (typeof content === "string" && content.trim()) {
-      return content;
-    }
-    throw new Error("接口返回为空");
-  }
-
-  async stream(
-    providerConfig: ProviderConfig,
-    messages: ChatMessage[],
-    onDelta: (text: string) => void
-  ): Promise<void> {
-    const response = await axios.post(
-      this.getEndpoint(providerConfig.baseURL || DEFAULT_BASE_URL),
-      {
-        model: providerConfig.model || DEFAULT_MODEL,
-        messages,
-        stream: true,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${providerConfig.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        responseType: "stream",
-        timeout: 120_000,
-      }
-    );
-
-    await new Promise<void>((resolve, reject) => {
-      let buffer = "";
-      const stream: NodeJS.ReadableStream = response.data;
-
-      const processLine = (line: string): void => {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) return;
-        const payload = trimmed.slice(5).trim();
-        if (!payload || payload === "[DONE]") return;
-
-        try {
-          const parsed = JSON.parse(payload);
-          const choice = parsed?.choices?.[0];
-          const delta = choice?.delta?.content;
-          if (typeof delta === "string" && delta) {
-            onDelta(delta);
-          }
-        } catch {
-          // ignore partial or non-JSON lines
-        }
-      };
-
-      stream.on("data", (chunk: Buffer | string) => {
-        buffer += chunk.toString();
-        let newlineIndex = buffer.indexOf("\n");
-        while (newlineIndex !== -1) {
-          const line = buffer.slice(0, newlineIndex);
-          buffer = buffer.slice(newlineIndex + 1);
-          processLine(line);
-          newlineIndex = buffer.indexOf("\n");
-        }
-      });
-
-      stream.on("end", () => {
-        if (buffer.trim()) {
-          processLine(buffer);
-        }
-        resolve();
-      });
-
-      stream.on("error", (error) => reject(error));
-    });
-  }
-}
-
-const implementedProviders = {
-  [DEFAULT_PROVIDER]: new DeepSeekProvider(),
-};
-
-function buildUserPrompt(question: string, repliedText?: string): string {
+function buildTextPrompt(question: string, repliedText?: string): string {
   if (repliedText && question) {
     return `被回复消息：\n${repliedText}\n\n当前问题：\n${question}`;
   }
-  if (repliedText) {
-    return repliedText;
-  }
+  if (repliedText) return repliedText;
   return question;
+}
+
+function buildVisionTextBlock(question: string, caption: string): string {
+  const lines: string[] = [];
+
+  if (question) {
+    lines.push(`当前问题：\n${question}`);
+    lines.push("请先直接回答当前问题，必要时再引用图片中的可见文字或细节作为依据。");
+  } else {
+    lines.push("默认任务：请简洁描述图片内容。");
+    lines.push("如果图片含有可辨认文字，优先提取关键文字，再结合图像内容回答。");
+    lines.push("看不清就明确说明，不要臆测，并尽量区分可见文字与解释。");
+    lines.push("如果不确定，请使用“可能”“看不清”“不确定”等保守表达。");
+  }
+
+  if (caption) {
+    lines.push(`图片消息 caption：\n${caption}`);
+  }
+
+  return lines.join("\n\n");
+}
+
+async function resolveAskContext(msg: Api.Message, payload: string): Promise<AskContext> {
+  const replied = await safeGetReplyMessage(msg);
+  const question = takeWithMarker(payload.trim(), MAX_QUESTION_CHARS, "问题");
+
+  if (!replied) {
+    if (!question) {
+      throw new Error(
+        `❌ 用法错误：请直接提问，或回复一条消息后再发送 <code>${escapeHtml(mainPrefix)}ds</code>。`,
+      );
+    }
+    return { route: "text", question };
+  }
+
+  if (replied.media) {
+    const image = await prepareReplyImage(msg);
+    if (!image) {
+      throw new Error(
+        `当前仅支持单张静态图片。请回复单张静态图片后执行 <code>${escapeHtml(mainPrefix)}ds</code> 或 <code>${escapeHtml(mainPrefix)}ds 这是什么</code>。`,
+      );
+    }
+    const caption = takeWithMarker((replied.message || "").trim(), MAX_CAPTION_CHARS, "caption");
+    return {
+      route: "vision",
+      question,
+      caption,
+      image,
+    };
+  }
+
+  const repliedText = (replied.message || "").trim();
+  if (!repliedText && !question) {
+    throw new Error(
+      `❌ 用法错误：请直接提问，或回复一条消息后再发送 <code>${escapeHtml(mainPrefix)}ds</code>。`,
+    );
+  }
+  if (!repliedText) {
+    throw new Error("❌ 被回复的消息没有可用文本。");
+  }
+  return {
+    route: "text",
+    question,
+    repliedText,
+  };
+}
+
+function buildMessages(config: DsConfig, context: AskContext): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  if (config.systemPrompt) {
+    messages.push({ role: "system", content: config.systemPrompt });
+  }
+
+  if (context.route === "vision") {
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "image_url",
+          image_url: {
+            url: `data:${context.image.mimeType};base64,${context.image.buffer.toString("base64")}`,
+            detail: "high",
+          },
+        },
+        {
+          type: "text",
+          text: buildVisionTextBlock(context.question, context.caption),
+        },
+      ],
+    });
+    return messages;
+  }
+
+  messages.push({
+    role: "user",
+    content: buildTextPrompt(context.question, context.repliedText),
+  });
+  return messages;
 }
 
 class DsPlugin extends Plugin {
   name = PLUGIN_NAME;
   description =
-    `DeepSeek 对话插件\n` +
+    `DS 对话插件\n` +
     `<code>${mainPrefix}ds [问题]</code> - 直接提问\n` +
-    `<code>${mainPrefix}ds status</code> - 查看当前配置\n` +
+    `<code>${mainPrefix}ds</code> - 回复文本继续对话，或回复单张静态图片做识别\n` +
+    `<code>${mainPrefix}ds 这是什么</code> - 回复图片并提问\n` +
+    `<code>${mainPrefix}ds status</code> - 查看 text / vision 路由状态\n` +
     `<code>${mainPrefix}ds config</code> - 查看格式化配置\n` +
-    `<code>${mainPrefix}ds test</code> - 测试当前 Provider\n` +
-    `<code>${mainPrefix}ds provider list</code> - 列出当前可用 Provider\n` +
-    `<code>${mainPrefix}ds provider set deepseek</code> - 切换 Provider，缺 API Key 时会交互补录\n` +
-    `<code>${mainPrefix}ds model set ${DEFAULT_MODEL}</code> - 设置默认模型\n` +
-    `<code>${mainPrefix}ds prompt show</code> - 查看系统提示词\n` +
-    `<code>${mainPrefix}ds prompt set 你是一个助手</code> - 设置系统提示词\n` +
-    `<code>${mainPrefix}ds prompt clear</code> - 清空系统提示词\n` +
+    `<code>${mainPrefix}ds provider list</code> - 查看 Provider、能力和当前路由\n` +
+    `<code>${mainPrefix}ds provider set text deepseek</code> - 设置文本路由 Provider\n` +
+    `<code>${mainPrefix}ds provider set vision siliconflow</code> - 设置视觉路由 Provider\n` +
+    `<code>${mainPrefix}ds key set siliconflow sk-xxx</code> - 设置 Provider API Key\n` +
+    `<code>${mainPrefix}ds model set text deepseek-v4-flash</code> - 设置文本模型\n` +
+    `<code>${mainPrefix}ds model set vision Qwen/Qwen3-VL-32B-Instruct</code> - 设置视觉模型\n` +
+    `<code>${mainPrefix}ds prompt show|set|clear</code> - 管理全局 System Prompt\n` +
     `<code>${mainPrefix}ds help</code> - 查看帮助`;
 
-  cmdHandlers: Record<
-    string,
-    (msg: Api.Message, trigger?: Api.Message) => Promise<void>
-  > = {
-    ds: async (msg, trigger) => {
-      if (!(await ensureSelfInvocation(msg))) {
-        return;
-      }
-
-      await this.handleDs(msg, trigger);
+  cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
+    ds: async (msg) => {
+      if (!(await ensureSelfInvocation(msg))) return;
+      await this.handleDs(msg);
     },
   };
 
   private readonly configStore = new DsConfigStore();
-  private lifecycle: GenerationContext | null = null;
 
-  setup(context: PluginRuntimeContext): void {
-    this.lifecycle = context.lifecycle;
-  }
-
-  cleanup(): void {
-    this.lifecycle = null;
-  }
-
-  private requireLifecycle(): GenerationContext {
-    if (!this.lifecycle) {
-      throw new Error("DS 插件尚未初始化");
-    }
-    return this.lifecycle;
-  }
-
-  private async handleDs(msg: Api.Message, trigger?: Api.Message): Promise<void> {
+  private async handleDs(msg: Api.Message): Promise<void> {
     const payload = getCommandPayload(msg.message || "");
     const [first = "", second = ""] = payload.split(/\s+/);
     const lowerFirst = first.toLowerCase();
@@ -508,34 +819,32 @@ class DsPlugin extends Plugin {
       await this.handleHelp(msg);
       return;
     }
-
     if (lowerFirst === "status") {
       await this.handleStatus(msg);
       return;
     }
-
     if (lowerFirst === "config") {
       await this.handleConfig(msg);
       return;
     }
-
-    if (lowerFirst === "test") {
-      await this.handleTest(msg);
-      return;
-    }
-
     if (lowerFirst === "provider") {
       await this.handleProvider(msg, lowerSecond, payload);
       return;
     }
-
     if (lowerFirst === "model") {
       await this.handleModel(msg, lowerSecond, payload);
       return;
     }
-
+    if (lowerFirst === "key") {
+      await this.handleKey(msg, lowerSecond, payload);
+      return;
+    }
     if (lowerFirst === "prompt") {
       await this.handlePrompt(msg, lowerSecond, payload);
+      return;
+    }
+    if (lowerFirst === "test") {
+      await safeEditMessage(msg, "❌ `ds test` 已删除。请直接使用 `status`、`provider list` 和实际请求验证。");
       return;
     }
 
@@ -548,164 +857,275 @@ class DsPlugin extends Plugin {
 
   private async handleStatus(msg: Api.Message): Promise<void> {
     const config = await this.configStore.get();
-    const providerConfig = getCurrentProviderConfig(config);
-    const text = [
-      "🤖 <b>DS 当前状态</b>",
-      `• Provider: <code>${escapeHtml(config.currentProvider)}</code>`,
-      `• Base URL: <code>${escapeHtml(providerConfig.baseURL || DEFAULT_BASE_URL)}</code>`,
-      `• Model: <code>${escapeHtml(providerConfig.model || DEFAULT_MODEL)}</code>`,
-      `• API Key: <code>${escapeHtml(maskApiKey(providerConfig.apiKey))}</code>`,
-      `• System Prompt: ${
+    const lines = ["🤖 <b>DS 当前状态</b>", ""];
+
+    for (const route of ["text", "vision"] as const) {
+      const providerId = getRouteProviderId(config, route);
+      const provider = getProviderOrThrow(providerId);
+      const providerConfig = config.providers[providerId];
+      const model = getRouteModel(config, route, providerId);
+      lines.push(`${route === "text" ? "📝" : "🖼️"} <b>${routeLabel(route)}</b>`);
+      lines.push(`• Provider: <code>${escapeHtml(provider.displayName)}</code> (<code>${escapeHtml(provider.id)}</code>)`);
+      lines.push(`• Base URL: <code>${escapeHtml(providerConfig.baseURL)}</code>`);
+      lines.push(`• Model: <code>${escapeHtml(model || "(未设置)")}</code>`);
+      lines.push(`• API Key: <code>${escapeHtml(maskApiKey(providerConfig.apiKey))}</code>`);
+      if (!providerConfig.apiKey) {
+        lines.push(`• 状态: <b>未配置 Key</b>`);
+        lines.push(`• 修复: <code>${escapeHtml(getRouteFixCommand(config, route))}</code>`);
+      } else {
+        lines.push("• 状态: 已就绪");
+      }
+      lines.push("");
+    }
+
+    lines.push(
+      `📝 <b>Global System Prompt</b>: ${
         config.systemPrompt
           ? `<code>${escapeHtml(truncateForTelegram(config.systemPrompt))}</code>`
           : "未设置"
       }`,
-    ].join("\n");
-    await safeEditMessage(msg, text, "html");
+    );
+
+    await safeEditMessage(msg, lines.join("\n"), "html");
   }
 
   private async handleConfig(msg: Api.Message): Promise<void> {
     const config = await this.configStore.get();
     const maskedConfig: DsConfig = {
-      currentProvider: config.currentProvider,
+      currentTextProvider: config.currentTextProvider,
+      currentVisionProvider: config.currentVisionProvider,
       systemPrompt: config.systemPrompt,
       providers: Object.fromEntries(
         Object.entries(config.providers).map(([name, providerConfig]) => [
           name,
           {
-            ...normalizeProviderConfig(providerConfig),
+            ...providerConfig,
             apiKey: maskApiKey(providerConfig.apiKey),
           },
-        ])
+        ]),
       ),
     };
 
-    const pretty = JSON.stringify(maskedConfig, null, 2);
     await safeEditMessage(
       msg,
-      `⚙️ <b>DS Config</b>\n<pre>${escapeHtml(truncateForTelegram(pretty))}</pre>`,
-      "html"
+      `⚙️ <b>DS Config</b>\n<pre>${escapeHtml(truncateForTelegram(JSON.stringify(maskedConfig, null, 2)))}</pre>`,
+      "html",
     );
   }
 
   private async handleProvider(
     msg: Api.Message,
     subCommand: string,
-    payload: string
+    payload: string,
   ): Promise<void> {
     if (subCommand === "list") {
       const config = await this.configStore.get();
-      const lines = Object.values(implementedProviders).map((provider) => {
-        const providerConfig = normalizeProviderConfig(config.providers[provider.id]);
-        const current = config.currentProvider === provider.id ? "✅ 当前" : "•";
-        const status = providerConfig.apiKey ? "已配置 Key" : "未配置 Key";
-        return `${current} <code>${escapeHtml(provider.id)}</code> - ${provider.displayName} (${status})`;
-      });
-      await safeEditMessage(msg, `🧩 <b>可用 Provider</b>\n${lines.join("\n")}`, "html");
-      return;
-    }
+      const lines = ["🧩 <b>可用 Provider</b>"];
 
-    if (subCommand === "set") {
-      const target = payload.split(/\s+/)[2]?.trim().toLowerCase();
-      if (!target) {
-        await safeEditMessage(
-          msg,
-          `用法：<code>${escapeHtml(mainPrefix)}ds provider set ${DEFAULT_PROVIDER}</code>`,
-          "html"
+      for (const provider of Object.values(PROVIDERS)) {
+        const providerConfig = config.providers[provider.id];
+        const flags: string[] = [];
+        if (config.currentTextProvider === provider.id) flags.push("Text Current");
+        if (config.currentVisionProvider === provider.id) flags.push("Vision Current");
+        const capabilities = [
+          provider.supportsText ? "Text" : null,
+          provider.supportsVision ? "Vision" : null,
+        ].filter(Boolean).join(", ");
+
+        lines.push(
+          [
+            `${flags.length ? "✅" : "•"} <b>${escapeHtml(provider.displayName)}</b> (<code>${escapeHtml(provider.id)}</code>)`,
+            `能力: ${escapeHtml(capabilities || "无")}`,
+            `状态: ${providerConfig.apiKey ? "已配置 Key" : "未配置 Key"}`,
+            flags.length ? `路由: ${escapeHtml(flags.join(" / "))}` : "路由: 未选中",
+          ].join(" | "),
         );
-        return;
       }
 
-      const provider = implementedProviders[target as keyof typeof implementedProviders];
-      if (!provider) {
-        await safeEditMessage(msg, `❌ Provider <code>${escapeHtml(target)}</code> 尚未实现。`, "html");
-        return;
-      }
-
-      let config = await this.configStore.get();
-      let providerConfig = normalizeProviderConfig(config.providers[provider.id]);
-      if (!providerConfig.apiKey) {
-        const me = msg.client ? await safeGetMe(msg.client) : undefined;
-        const ownerId = getComparableId(me?.id) || getMessageSenderId(msg);
-        const apiKey = await promptForApiKey({
-          commandMessage: msg,
-          lifecycle: this.requireLifecycle(),
-          ownerId,
-        });
-        config = await this.configStore.setProviderConfig(provider.id, { apiKey });
-        providerConfig = getCurrentProviderConfig({
-          ...config,
-          currentProvider: provider.id,
-        });
-      }
-
-      config = await this.configStore.set({ currentProvider: provider.id });
-      providerConfig = normalizeProviderConfig(config.providers[provider.id]);
-      await safeEditMessage(
-        msg,
-        [
-          `✅ Provider 已切换为 <code>${escapeHtml(provider.id)}</code>`,
-          `API Key: <code>${escapeHtml(maskApiKey(providerConfig.apiKey))}</code>`,
-          `Model: <code>${escapeHtml(providerConfig.model)}</code>`,
-        ].join("\n"),
-        "html"
-      );
+      await safeEditMessage(msg, lines.join("\n"), "html");
       return;
     }
 
-    await safeEditMessage(
-      msg,
-      `用法：<code>${escapeHtml(mainPrefix)}ds provider list</code>\n<code>${escapeHtml(mainPrefix)}ds provider set ${DEFAULT_PROVIDER}</code>`,
-      "html"
-    );
-  }
-
-  private async handleModel(msg: Api.Message, subCommand: string, payload: string): Promise<void> {
     if (subCommand !== "set") {
       await safeEditMessage(
         msg,
-        `用法：<code>${escapeHtml(mainPrefix)}ds model set ${DEFAULT_MODEL}</code>`,
-        "html"
+        [
+          `用法：<code>${escapeHtml(mainPrefix)}ds provider list</code>`,
+          `<code>${escapeHtml(mainPrefix)}ds provider set text deepseek</code>`,
+          `<code>${escapeHtml(mainPrefix)}ds provider set vision siliconflow</code>`,
+        ].join("\n"),
+        "html",
       );
       return;
     }
 
-    const model = payload.replace(/^model\s+set\s+/i, "").trim();
-    if (!model) {
+    const parts = payload.split(/\s+/);
+    if (parts.length === 3) {
       await safeEditMessage(
         msg,
-        `用法：<code>${escapeHtml(mainPrefix)}ds model set ${DEFAULT_MODEL}</code>`,
-        "html"
+        "❌ 旧命令 `ds provider set <provider>` 已废弃，请改用 `ds provider set text <provider>` 或 `ds provider set vision <provider>`。",
       );
       return;
     }
 
-    const current = await this.configStore.get();
-    const config = await this.configStore.setProviderConfig(current.currentProvider, { model });
-    const providerConfig = getCurrentProviderConfig(config);
+    const route = parts[2]?.trim().toLowerCase() as RouteKind | undefined;
+    const providerId = parts[3]?.trim().toLowerCase();
+    if ((route !== "text" && route !== "vision") || !providerId) {
+      await safeEditMessage(
+        msg,
+        [
+          `用法：<code>${escapeHtml(mainPrefix)}ds provider set text deepseek</code>`,
+          `<code>${escapeHtml(mainPrefix)}ds provider set vision siliconflow</code>`,
+        ].join("\n"),
+        "html",
+      );
+      return;
+    }
+
+    const provider = PROVIDERS[providerId];
+    if (!provider) {
+      await safeEditMessage(msg, `❌ Provider <code>${escapeHtml(providerId)}</code> 尚未实现。`, "html");
+      return;
+    }
+    if (route === "text" && !provider.supportsText) {
+      await safeEditMessage(msg, `❌ Provider <code>${escapeHtml(providerId)}</code> 不支持 text 路由。`, "html");
+      return;
+    }
+    if (route === "vision" && !provider.supportsVision) {
+      await safeEditMessage(msg, `❌ Provider <code>${escapeHtml(providerId)}</code> 不支持 vision 路由。`, "html");
+      return;
+    }
+
+    const patch =
+      route === "text"
+        ? { currentTextProvider: providerId }
+        : { currentVisionProvider: providerId };
+    const config = await this.configStore.set(patch);
+    const providerConfig = config.providers[providerId];
+    const model = getRouteModel(config, route, providerId);
+    const lines = [
+      `✅ ${routeLabel(route)} 已切换为 <code>${escapeHtml(provider.displayName)}</code> (<code>${escapeHtml(provider.id)}</code>)`,
+      `Model: <code>${escapeHtml(model || "(未设置)")}</code>`,
+      `API Key: <code>${escapeHtml(maskApiKey(providerConfig.apiKey))}</code>`,
+    ];
+    if (!providerConfig.apiKey) {
+      lines.push(`提示：该路由尚未配置 API Key，可执行 <code>${escapeHtml(getRouteFixCommand(config, route))}</code>`);
+    }
+    await safeEditMessage(msg, lines.join("\n"), "html");
+  }
+
+  private async handleModel(
+    msg: Api.Message,
+    subCommand: string,
+    payload: string,
+  ): Promise<void> {
+    if (subCommand !== "set") {
+      await safeEditMessage(
+        msg,
+        [
+          `用法：<code>${escapeHtml(mainPrefix)}ds model set text deepseek-v4-flash</code>`,
+          `<code>${escapeHtml(mainPrefix)}ds model set vision Qwen/Qwen3-VL-32B-Instruct</code>`,
+        ].join("\n"),
+        "html",
+      );
+      return;
+    }
+
+    const parts = payload.split(/\s+/);
+    if (parts.length === 3) {
+      await safeEditMessage(
+        msg,
+        "❌ 旧命令 `ds model set <model>` 已废弃，请改用 `ds model set text <model>` 或 `ds model set vision <model>`。",
+      );
+      return;
+    }
+
+    const route = parts[2]?.trim().toLowerCase() as RouteKind | undefined;
+    const model = payload.replace(/^model\s+set\s+(text|vision)\s+/i, "").trim();
+    if ((route !== "text" && route !== "vision") || !model) {
+      await safeEditMessage(
+        msg,
+        [
+          `用法：<code>${escapeHtml(mainPrefix)}ds model set text deepseek-v4-flash</code>`,
+          `<code>${escapeHtml(mainPrefix)}ds model set vision Qwen/Qwen3-VL-32B-Instruct</code>`,
+        ].join("\n"),
+        "html",
+      );
+      return;
+    }
+
+    const config = await this.configStore.get();
+    const providerId = getRouteProviderId(config, route);
+    const updated = await this.configStore.setProviderConfig(
+      providerId,
+      route === "text" ? { textModel: model } : { visionModel: model },
+    );
+    const provider = getProviderOrThrow(providerId);
     await safeEditMessage(
       msg,
-      `✅ <code>${escapeHtml(config.currentProvider)}</code> 的默认模型已设置为 <code>${escapeHtml(providerConfig.model)}</code>`,
-      "html"
+      `✅ <code>${escapeHtml(provider.displayName)}</code> 的 ${route} 模型已设置为 <code>${escapeHtml(getRouteModel(updated, route, providerId))}</code>`,
+      "html",
     );
   }
 
-  private async handlePrompt(msg: Api.Message, subCommand: string, payload: string): Promise<void> {
+  private async handleKey(
+    msg: Api.Message,
+    subCommand: string,
+    payload: string,
+  ): Promise<void> {
+    if (subCommand !== "set") {
+      await safeEditMessage(
+        msg,
+        `用法：<code>${escapeHtml(mainPrefix)}ds key set siliconflow sk-xxx</code>`,
+        "html",
+      );
+      return;
+    }
+
+    const parts = payload.split(/\s+/);
+    const providerId = parts[2]?.trim().toLowerCase();
+    const apiKey = payload.replace(/^key\s+set\s+\S+\s+/i, "").trim();
+    if (!providerId || !apiKey) {
+      await safeEditMessage(
+        msg,
+        `用法：<code>${escapeHtml(mainPrefix)}ds key set siliconflow sk-xxx</code>`,
+        "html",
+      );
+      return;
+    }
+    if (!PROVIDERS[providerId]) {
+      await safeEditMessage(msg, `❌ Provider <code>${escapeHtml(providerId)}</code> 尚未实现。`, "html");
+      return;
+    }
+
+    await this.configStore.setProviderConfig(providerId, { apiKey });
+    await safeEditMessage(
+      msg,
+      `✅ Provider <code>${escapeHtml(providerId)}</code> 的 API Key 已更新：<code>${escapeHtml(maskApiKey(apiKey))}</code>`,
+      "html",
+    );
+  }
+
+  private async handlePrompt(
+    msg: Api.Message,
+    subCommand: string,
+    payload: string,
+  ): Promise<void> {
     if (subCommand === "show") {
       const config = await this.configStore.get();
       await safeEditMessage(
         msg,
         config.systemPrompt
-          ? `📝 <b>当前 System Prompt</b>\n<code>${escapeHtml(config.systemPrompt)}</code>`
-          : "📝 当前未设置 System Prompt。",
-        config.systemPrompt ? "html" : undefined
+          ? `📝 <b>当前 Global System Prompt</b>\n<code>${escapeHtml(config.systemPrompt)}</code>`
+          : "📝 当前未设置 Global System Prompt。",
+        config.systemPrompt ? "html" : undefined,
       );
       return;
     }
 
     if (subCommand === "clear") {
       await this.configStore.set({ systemPrompt: "" });
-      await safeEditMessage(msg, "✅ System Prompt 已清空。");
+      await safeEditMessage(msg, "✅ Global System Prompt 已清空。");
       return;
     }
 
@@ -715,12 +1135,12 @@ class DsPlugin extends Plugin {
         await safeEditMessage(
           msg,
           `用法：<code>${escapeHtml(mainPrefix)}ds prompt set 你是一个简洁的助手</code>`,
-          "html"
+          "html",
         );
         return;
       }
       await this.configStore.set({ systemPrompt: prompt });
-      await safeEditMessage(msg, "✅ System Prompt 已更新。");
+      await safeEditMessage(msg, "✅ Global System Prompt 已更新。");
       return;
     }
 
@@ -731,92 +1151,45 @@ class DsPlugin extends Plugin {
         `<code>${escapeHtml(mainPrefix)}ds prompt set 你是一个简洁的助手</code>`,
         `<code>${escapeHtml(mainPrefix)}ds prompt clear</code>`,
       ].join("\n"),
-      "html"
-    );
-  }
-
-  private async handleTest(msg: Api.Message): Promise<void> {
-    const config = await this.configStore.get();
-    const provider = implementedProviders[config.currentProvider as keyof typeof implementedProviders];
-    const providerConfig = getCurrentProviderConfig(config);
-    if (!provider) {
-      await safeEditMessage(msg, `❌ 当前 Provider <code>${escapeHtml(config.currentProvider)}</code> 不可用。`, "html");
-      return;
-    }
-    if (!providerConfig.apiKey) {
-      await safeEditMessage(
-        msg,
-        `❌ 当前 Provider 未配置 API Key，请先执行 <code>${escapeHtml(mainPrefix)}ds provider set ${escapeHtml(config.currentProvider)}</code>。`,
-        "html"
-      );
-      return;
-    }
-
-    await safeEditMessage(msg, "🧪 正在测试当前 Provider…");
-    const messages: ChatMessage[] = [
-      { role: "user", content: "请回复“测试成功”四个字。" },
-    ];
-
-    const result = await provider.complete(providerConfig, messages);
-    await safeEditMessage(
-      msg,
-      `✅ 测试成功\n\n${truncateForTelegram(result)}`
+      "html",
     );
   }
 
   private async handleAsk(msg: Api.Message, payload: string): Promise<void> {
-    const config = await this.configStore.get();
-    const provider = implementedProviders[config.currentProvider as keyof typeof implementedProviders];
-    const providerConfig = getCurrentProviderConfig(config);
-    if (!provider) {
-      await safeEditMessage(msg, `❌ 当前 Provider <code>${escapeHtml(config.currentProvider)}</code> 不可用。`, "html");
+    let context: AskContext;
+    try {
+      context = await resolveAskContext(msg, payload);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await safeEditMessage(msg, message, message.includes("<code>") ? "html" : undefined);
       return;
     }
+
+    const config = await this.configStore.get();
+    const route = context.route;
+    const providerId = getRouteProviderId(config, route);
+    const provider = getProviderOrThrow(providerId);
+    const providerConfig = config.providers[providerId];
+    const routeModel = getRouteModel(config, route, providerId);
+
     if (!providerConfig.apiKey) {
       await safeEditMessage(
         msg,
-        `❌ 当前 Provider 未配置 API Key，请先执行 <code>${escapeHtml(mainPrefix)}ds provider set ${escapeHtml(config.currentProvider)}</code>。`,
-        "html"
+        `❌ ${routeLabel(route)} 未配置 API Key，请先执行 <code>${escapeHtml(getRouteFixCommand(config, route))}</code>。`,
+        "html",
       );
       return;
     }
 
-    const replied = await safeGetReplyMessage(msg);
-    const repliedText = (replied?.message || "").trim();
-    const question = payload.trim();
-    const shouldPreserveQuestion = question.length > 0;
+    const messages = buildMessages(config, context);
 
-    if (!repliedText && !question) {
-      await safeEditMessage(
-        msg,
-        `❌ 用法错误：请直接提问，或回复一条消息后再发送 <code>${escapeHtml(mainPrefix)}ds</code>。`,
-        "html"
-      );
-      return;
-    }
-
-    if (replied && !repliedText) {
-      await safeEditMessage(msg, "❌ 被回复的消息没有可用文本。");
-      return;
-    }
-
-    const messages: ChatMessage[] = [];
-    if (config.systemPrompt) {
-      messages.push({ role: "system", content: config.systemPrompt });
-    }
-    messages.push({
-      role: "user",
-      content: buildUserPrompt(question, repliedText || undefined),
-    });
-
-    if (shouldPreserveQuestion) {
-      await safeEditMessage(
-        msg,
-        `${escapeHtml(question)}\n\n──────────\n\n思考中…`,
-        "html"
-      );
+    if (context.question) {
+      await safeEditMessage(msg, `${escapeHtml(context.question)}\n\n──────────\n\n思考中…`, "html");
     } else {
-      await safeEditMessage(msg, `🤖 正在请求 DeepSeek (${providerConfig.model})…`);
+      await safeEditMessage(
+        msg,
+        `🤖 正在请求 ${provider.displayName} (${routeModel})…`,
+      );
     }
 
     let combined = "";
@@ -826,19 +1199,37 @@ class DsPlugin extends Plugin {
     const flush = async (force = false): Promise<void> => {
       if (!force && Date.now() - lastEditAt < STREAM_EDIT_INTERVAL_MS) return;
       lastEditAt = Date.now();
-      const rendered = shouldPreserveQuestion
-        ? formatQuestionAndAnswer(question, providerConfig.model, combined)
-        : formatAiOutput(combined);
-      await safeEditMessage(msg, rendered, "html");
+      await safeEditMessage(
+        msg,
+        renderAnswer({
+          providerName: provider.displayName,
+          model: routeModel,
+          answer: combined,
+          question: context.question,
+        }),
+        "html",
+      );
     };
 
-    await provider.stream(providerConfig, messages, (delta) => {
-      combined += delta;
-      renderChain = renderChain.then(() => flush(false)).catch(() => undefined);
-    });
+    try {
+      if (provider.supportsStream) {
+        await providerClients[providerId].stream(route, providerConfig, messages, (delta) => {
+          combined += delta;
+          renderChain = renderChain.then(() => flush(false)).catch(() => undefined);
+        });
+        await renderChain;
+      } else {
+        combined = await providerClients[providerId].complete(route, providerConfig, messages);
+      }
 
-    await renderChain;
-    await flush(true);
+      if (!combined.trim()) {
+        throw new Error(route === "vision" ? "视觉接口返回为空" : "接口返回为空");
+      }
+      await flush(true);
+    } catch (error) {
+      const friendly = mapProviderError(error, route, routeModel);
+      await safeEditMessage(msg, `❌ ${friendly}`, friendly.includes("<code>") ? "html" : undefined);
+    }
   }
 }
 
