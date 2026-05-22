@@ -640,10 +640,22 @@ function mapProviderError(error: unknown, route: RouteKind, routeModel: string):
   }
 
   const status = error.response?.status;
-  const detail =
-    typeof error.response?.data === "string"
-      ? error.response.data.slice(0, 300)
-      : JSON.stringify(error.response?.data || {}).slice(0, 300);
+  let detail = "";
+  if (typeof error.response?.data === "string") {
+    detail = error.response.data.slice(0, 300);
+  } else if (error.response?.data && typeof error.response.data === "object") {
+    const data = error.response.data as Record<string, unknown>;
+    const candidates = [
+      data.message,
+      data.error,
+      (data.error as Record<string, unknown> | undefined)?.message,
+      (data.detail as unknown),
+    ];
+    detail = candidates.find((value) => typeof value === "string" && value.trim()) as string || "";
+  }
+  if (!detail) {
+    detail = error.message || "";
+  }
   const normalizedDetail = detail.toLowerCase();
 
   if (error.code === "ECONNABORTED") {
