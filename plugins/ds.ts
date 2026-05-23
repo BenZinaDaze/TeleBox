@@ -9,10 +9,14 @@ import { getPrefixes } from "@utils/pluginManager";
 import { safeGetMe } from "@utils/authGuards";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
 import { TelegramFormatter } from "@utils/telegramFormatter";
+import {
+  createChatCompletion,
+  streamChatCompletion,
+} from "@utils/openAICompat";
 
 type RouteKind = "text" | "vision";
-type ProviderId = "deepseek" | "siliconflow" | "ark";
-type KeyProviderId = "deepseek" | "siliconflow" | "ark";
+type ProviderId = "deepseek" | "siliconflow" | "ark" | "kimi";
+type KeyProviderId = "deepseek" | "siliconflow" | "ark" | "kimi";
 
 type ProviderDefinition = {
   id: ProviderId;
@@ -142,6 +146,17 @@ const PROVIDERS: Record<ProviderId, ProviderDefinition> = {
     model: "doubao-seed-2-0-lite-260428",
     description: "Ark 模型配置",
   },
+  kimi: {
+    id: "kimi",
+    displayName: "Kimi",
+    baseURL: "https://api.moonshot.cn/v1",
+    keyProviderId: "kimi",
+    supportsText: true,
+    supportsVision: true,
+    supportsStream: true,
+    model: "kimi-k2.6",
+    description: "Kimi 模型配置",
+  },
 };
 
 const DEFAULT_CONFIG: DsConfig = {
@@ -157,6 +172,7 @@ const DEFAULT_CONFIG: DsConfig = {
     deepseek: "",
     siliconflow: "",
     ark: "",
+    kimi: "",
   },
   providers: {
     deepseek: {
@@ -170,6 +186,10 @@ const DEFAULT_CONFIG: DsConfig = {
     ark: {
       model: "",
       models: [...ARK_BALANCED_MODELS],
+    },
+    kimi: {
+      model: "kimi-k2.6",
+      models: [],
     },
   },
   cursors: {
@@ -251,7 +271,8 @@ function normalizeProviderId(value?: string | null): ProviderId | null {
   if (
     normalized === "deepseek" ||
     normalized === "siliconflow" ||
-    normalized === "ark"
+    normalized === "ark" ||
+    normalized === "kimi"
   ) {
     return normalized;
   }
@@ -358,11 +379,13 @@ function normalizeConfig(raw?: unknown): DsConfig {
       deepseek: typeof rawKeys.deepseek === "string" ? rawKeys.deepseek.trim() : "",
       siliconflow: typeof rawKeys.siliconflow === "string" ? rawKeys.siliconflow.trim() : "",
       ark: typeof rawKeys.ark === "string" ? rawKeys.ark.trim() : "",
+      kimi: typeof rawKeys.kimi === "string" ? rawKeys.kimi.trim() : "",
     },
     providers: {
       deepseek: normalizeProviderConfig("deepseek", rawProviders.deepseek),
       siliconflow: normalizeProviderConfig("siliconflow", rawProviders.siliconflow),
       ark: normalizeProviderConfig("ark", rawProviders.ark),
+      kimi: normalizeProviderConfig("kimi", rawProviders.kimi),
     },
     cursors: {
       text: typeof rawCursors.text === "number" && Number.isFinite(rawCursors.text)
@@ -720,105 +743,16 @@ async function resolveAskContext(msg: Api.Message, payload: string): Promise<Ask
   };
 }
 
-class OpenAICompatProvider {
-  private readonly baseURL: string;
-  private readonly apiKey: string;
-
-  constructor(baseURL: string, apiKey: string) {
-    this.baseURL = baseURL;
-    this.apiKey = apiKey;
+function getProviderExtraBody(providerId: ProviderId): Record<string, unknown> | undefined {
+  if (providerId === "kimi") {
+    return { thinking: { type: "enabled" } };
   }
+  return undefined;
+}
 
-  private getEndpoint(): string {
-    return `${this.baseURL.replace(/\/+$/, "")}/chat/completions`;
-  }
-
-  async complete(
-    route: RouteKind,
-    model: string,
-    messages: ChatMessage[],
-  ): Promise<string> {
-    const response = await axios.post(
-      this.getEndpoint(),
-      {
-        model,
-        messages,
-        stream: false,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 60_000,
-      },
-    );
-
-    const content = response.data?.choices?.[0]?.message?.content;
-    if (typeof content === "string" && content.trim()) return content;
-    throw new Error(route === "vision" ? "视觉接口返回为空" : "接口返回为空");
-  }
-
-  async stream(
-    model: string,
-    messages: ChatMessage[],
-    onDelta: (text: string) => void,
-  ): Promise<void> {
-    const response = await axios.post(
-      this.getEndpoint(),
-      {
-        model,
-        messages,
-        stream: true,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        responseType: "stream",
-        timeout: 120_000,
-      },
-    );
-
-    await new Promise<void>((resolve, reject) => {
-      let buffer = "";
-      const stream: NodeJS.ReadableStream = response.data;
-
-      const processLine = (line: string): void => {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) return;
-        const payload = trimmed.slice(5).trim();
-        if (!payload || payload === "[DONE]") return;
-
-        try {
-          const parsed = JSON.parse(payload);
-          const delta = parsed?.choices?.[0]?.delta?.content;
-          if (delta) onDelta(delta);
-        } catch {
-          // ignore partial JSON chunks
-        }
-      };
-
-      stream.on("data", (chunk: Buffer | string) => {
-        buffer += chunk.toString();
-        let newlineIndex = buffer.indexOf("\n");
-        while (newlineIndex !== -1) {
-          const line = buffer.slice(0, newlineIndex);
-          buffer = buffer.slice(newlineIndex + 1);
-          processLine(line);
-          newlineIndex = buffer.indexOf("\n");
-        }
-      });
-
-      stream.on("end", () => {
-        if (buffer.trim()) processLine(buffer);
-        resolve();
-      });
-
-      stream.on("error", reject);
-    });
-  }
+function extractCompletionContent(response: unknown): string | null {
+  const content = (response as Record<string, any>)?.choices?.[0]?.message?.content;
+  return typeof content === "string" && content.trim() ? content : null;
 }
 
 class DsConfigStore {
@@ -1110,7 +1044,7 @@ class DsPlugin extends Plugin {
       await safeEditMessage(
         msg,
         `用法：<code>${escapeHtml(mainPrefix)}ds key &lt;provider&gt; &lt;apiKey&gt;</code>\n` +
-          `provider: <code>deepseek</code> / <code>siliconflow</code> / <code>ark</code>`,
+          `provider: <code>deepseek</code> / <code>siliconflow</code> / <code>ark</code> / <code>kimi</code>`,
         "html",
       );
       return;
@@ -1228,7 +1162,7 @@ class DsPlugin extends Plugin {
     }
 
     const messages = buildMessages(selection.config, context);
-    const client = new OpenAICompatProvider(selection.provider.baseURL, apiKey);
+    const extraBody = getProviderExtraBody(selection.provider.id);
 
     if (context.question) {
       await safeEditMessage(msg, `💬 ${escapeHtml(context.question)}\n──────────\n🤔 思考中…`, "html");
@@ -1257,13 +1191,31 @@ class DsPlugin extends Plugin {
 
     try {
       if (selection.provider.supportsStream) {
-        await client.stream(selection.model, messages, (delta) => {
-          combined += delta;
-          renderChain = renderChain.then(() => flush(false)).catch(() => undefined);
-        });
+        await streamChatCompletion(
+          {
+            baseURL: selection.provider.baseURL,
+            apiKey,
+            model: selection.model,
+            messages,
+            extraBody,
+            timeout: 120_000,
+          },
+          (delta) => {
+            combined += delta;
+            renderChain = renderChain.then(() => flush(false)).catch(() => undefined);
+          },
+        );
         await renderChain;
       } else {
-        combined = await client.complete(route, selection.model, messages);
+        const response = await createChatCompletion({
+          baseURL: selection.provider.baseURL,
+          apiKey,
+          model: selection.model,
+          messages,
+          extraBody,
+          timeout: 60_000,
+        });
+        combined = extractCompletionContent(response) || "";
       }
 
       if (!combined.trim()) {
