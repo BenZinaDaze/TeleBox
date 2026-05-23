@@ -720,6 +720,10 @@ function compact(text: string, limit = 180): string {
   return `${text.slice(0, limit)}...`;
 }
 
+function buildExpandableBlockquote(lines: string[]): string {
+  return `<blockquote expandable>${lines.join("\n\n")}</blockquote>`;
+}
+
 function getFloodWaitMs(error: unknown): number | null {
   const message = extractErrorMessage(error);
   const match = /FLOOD(?:_PREMIUM)?_WAIT_(\d+)/.exec(message) || /A wait of (\d+) seconds/i.exec(message);
@@ -1669,17 +1673,22 @@ class ArchivePlugin extends Plugin {
       });
 
       const chunks: string[] = [];
-      let current = `${header.join("\n")}\n\n`;
+      let currentLines: string[] = [];
+      let currentHeader = header.join("\n");
       for (const line of lines) {
-        const separator = current.endsWith("\n\n") ? "" : "\n\n";
-        if ((current + separator + line).length > MAX_CHUNK_LENGTH) {
-          chunks.push(current);
-          current = `🔎 <b>Archive 查询结果</b>（续）\n\n${line}`;
+        const candidateLines = [...currentLines, line];
+        const candidate = `${currentHeader}\n\n${buildExpandableBlockquote(candidateLines)}`;
+        if (candidate.length > MAX_CHUNK_LENGTH && currentLines.length > 0) {
+          chunks.push(`${currentHeader}\n\n${buildExpandableBlockquote(currentLines)}`);
+          currentHeader = "🔎 <b>Archive 查询结果</b>（续）";
+          currentLines = [line];
         } else {
-          current += separator + line;
+          currentLines = candidateLines;
         }
       }
-      if (current) chunks.push(current);
+      if (currentLines.length > 0) {
+        chunks.push(`${currentHeader}\n\n${buildExpandableBlockquote(currentLines)}`);
+      }
 
       await msg.edit({ text: chunks[0], parseMode: "html", linkPreview: false });
       for (let i = 1; i < chunks.length; i += 1) {
