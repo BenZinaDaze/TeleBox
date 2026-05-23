@@ -1134,6 +1134,8 @@ class DsPlugin extends Plugin {
   }
 
   private async handleAsk(msg: Api.Message, payload: string): Promise<void> {
+    await safeEditMessage(msg, "🤖 正在整理上下文…");
+
     let context: AskContext;
     try {
       context = await resolveAskContext(msg, payload);
@@ -1164,10 +1166,11 @@ class DsPlugin extends Plugin {
     const messages = buildMessages(selection.config, context);
     const extraBody = getProviderExtraBody(selection.provider.id);
 
+    const thinkingLabel = `🤖 正在使用 ${selection.provider.displayName} (${selection.model})…`;
     if (context.question) {
-      await safeEditMessage(msg, `💬 ${escapeHtml(context.question)}\n──────────\n🤔 思考中…`, "html");
+      await safeEditMessage(msg, `💬 ${escapeHtml(context.question)}\n──────────\n${thinkingLabel}`, "html");
     } else {
-      await safeEditMessage(msg, `🤖 正在请求 ${selection.provider.displayName} (${selection.model})…`);
+      await safeEditMessage(msg, thinkingLabel);
     }
 
     let combined = "";
