@@ -957,7 +957,6 @@ function mapProviderError(error: unknown, route: RouteKind, routeModel: string):
 
 class DsPlugin extends Plugin {
   name = PLUGIN_NAME;
-  description = this.renderHelpText();
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     ds: async (msg) => {
@@ -992,6 +991,10 @@ class DsPlugin extends Plugin {
 
   private renderHelpText(): string {
     return this.helpLines.join("\n");
+  }
+
+  get description(): string {
+    return this.renderHelpText();
   }
 
   private async handleDs(msg: Api.Message): Promise<void> {
