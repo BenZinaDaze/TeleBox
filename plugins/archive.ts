@@ -42,6 +42,18 @@ function createRuntimeStats(): ArchiveRuntimeStats {
   };
 }
 
+function renderHelpSections(
+  title: string,
+  intro: string,
+  sections: Array<{ heading: string; lines: string[] }>,
+): string {
+  const blocks = [title, "", `<blockquote>${intro}</blockquote>`];
+  for (const section of sections) {
+    blocks.push("", section.heading, `<blockquote>${section.lines.join("\n")}</blockquote>`);
+  }
+  return blocks.join("\n");
+}
+
 type BackfillAbortContext = {
   jobId: number;
   processedChats: number;
@@ -1160,18 +1172,38 @@ class ArchivePlugin extends Plugin {
     this.runtimeStats = createRuntimeStats();
   }
 
-  description: string = `持久化归档群组/频道消息并提供全文检索
-<code>${commandName} help</code> 查看帮助
-<code>${commandName} status</code> 查看归档状态
-<code>${commandName} backfill</code> 启动历史补抓
-<code>${commandName} backfill resume</code> 手动恢复最近一次可续跑补抓
-<code>${commandName} backfill stop</code> 停止当前补抓并保留断点
-<code>${commandName} bl</code> 将当前会话加入黑名单（不采集、不搜索）
-<code>${commandName} bl rm</code> 将当前会话移出黑名单
-<code>${commandName} bl list</code> 查看黑名单
-<code>${commandName} search 关键词 [chat=@xxx] [user=@xxx] [from=2026-05-01] [to=2026-05-22] [limit=10]</code>
-<code>${commandName} chat @chat或chatId [关键词] [from=YYYY-MM-DD] [to=YYYY-MM-DD] [limit=10]</code>
-<code>${commandName} user @user或userId [关键词] [chat=@chat] [from=YYYY-MM-DD] [to=YYYY-MM-DD] [limit=10]</code>`;
+  description: string = renderHelpSections(
+    "🗂️ <b>Archive 帮助</b>",
+    "持久化归档群组/频道消息，并提供全文检索与历史补抓。",
+    [
+      {
+        heading: "📌 基本命令：",
+        lines: [
+          `<code>${commandName} help</code> - 查看帮助`,
+          `<code>${commandName} status</code> - 查看归档状态`,
+          `<code>${commandName} backfill</code> - 启动历史补抓`,
+          `<code>${commandName} backfill resume</code> - 手动恢复最近一次可续跑补抓`,
+          `<code>${commandName} backfill stop</code> - 停止当前补抓并保留断点`,
+        ],
+      },
+      {
+        heading: "🚫 黑名单：",
+        lines: [
+          `<code>${commandName} bl</code> - 将当前会话加入黑名单（不采集、不搜索）`,
+          `<code>${commandName} bl rm</code> - 将当前会话移出黑名单`,
+          `<code>${commandName} bl list</code> - 查看黑名单`,
+        ],
+      },
+      {
+        heading: "🔎 检索命令：",
+        lines: [
+          `<code>${commandName} search 关键词 [chat=@xxx] [user=@xxx] [from=2026-05-01] [to=2026-05-22] [limit=10]</code>`,
+          `<code>${commandName} chat @chat或chatId [关键词] [from=YYYY-MM-DD] [to=YYYY-MM-DD] [limit=10]</code>`,
+          `<code>${commandName} user @user或userId [关键词] [chat=@chat] [from=YYYY-MM-DD] [to=YYYY-MM-DD] [limit=10]</code>`,
+        ],
+      },
+    ],
+  );
 
   ignoreEdited = false;
   listenMessageHandlerIgnoreEdited = false;

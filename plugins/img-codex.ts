@@ -109,6 +109,18 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+function renderHelpSections(
+  title: string,
+  intro: string,
+  sections: Array<{ heading: string; lines: string[] }>,
+): string {
+  const blocks = [title, "", `<blockquote>${intro}</blockquote>`];
+  for (const section of sections) {
+    blocks.push("", section.heading, `<blockquote>${section.lines.join("\n")}</blockquote>`);
+  }
+  return blocks.join("\n");
+}
+
 function getComparableId(value: unknown): string | undefined {
   if (value == null) return undefined;
   if (
@@ -903,16 +915,29 @@ async function handleAuthCommand(
 async function handleImgHelp(msg: Api.Message): Promise<void> {
   await safeEditMessage(
     msg,
-    [
+    renderHelpSections(
       "🖼️ <b>IMG 帮助</b>",
-      "<code>.img 提示词</code> - 纯文本生成图片",
-      "<code>.img -t 提示词</code> - 生成透明背景图片",
-      "<code>.img</code> 回复图片后发送提示词 - 使用参考图生成",
-      "<code>.img auth set &lt;access_token&gt;</code> - 设置手动覆盖 token",
-      "<code>.img auth status</code> - 查看当前鉴权来源",
-      "<code>.img auth clear</code> - 清除手动覆盖 token",
-      "<code>.img help</code> - 查看帮助",
-    ].join("\n"),
+      `通过 Codex 调用 <code>${CODEX_MODEL}</code> 生成图片。`,
+      [
+        {
+          heading: "📌 基本用法：",
+          lines: [
+            "<code>.img 提示词</code> - 纯文本生成图片",
+            "<code>.img -t 提示词</code> - 生成透明背景图片",
+            "<code>.img</code> 回复图片后发送提示词 - 使用参考图生成",
+          ],
+        },
+        {
+          heading: "🔐 鉴权管理：",
+          lines: [
+            "<code>.img auth set &lt;access_token&gt;</code> - 设置手动覆盖 token",
+            "<code>.img auth status</code> - 查看当前鉴权来源",
+            "<code>.img auth clear</code> - 清除手动覆盖 token",
+            "<code>.img help</code> - 查看帮助",
+          ],
+        },
+      ],
+    ),
     "html",
   );
 }
@@ -1045,15 +1070,29 @@ class CodexImagePlugin extends Plugin {
     return this.lifecycle;
   }
 
-  description =
-    `通过 Codex 调用 ${CODEX_MODEL} 生成图片\n\n` +
-    `• <code>.img 提示词</code> 纯文本生成图片\n` +
-    `• <code>.img -t 提示词</code> 生成透明背景图片\n` +
-    `• 回复图片并发送 <code>.img 提示词</code> 使用参考图生成\n` +
-    `• <code>.img auth set token</code> 设置手动覆盖 token\n` +
-    `• <code>.img auth status</code> 查看当前鉴权来源\n` +
-    `• <code>.img auth clear</code> 清除手动覆盖 token\n` +
-    `• <code>.img help</code> 查看帮助`;
+  description = renderHelpSections(
+    "🖼️ <b>IMG 帮助</b>",
+    `通过 Codex 调用 <code>${CODEX_MODEL}</code> 生成图片。`,
+    [
+      {
+        heading: "📌 基本用法：",
+        lines: [
+          "<code>.img 提示词</code> - 纯文本生成图片",
+          "<code>.img -t 提示词</code> - 生成透明背景图片",
+          "<code>.img</code> 回复图片并发送提示词 - 使用参考图生成",
+        ],
+      },
+      {
+        heading: "🔐 鉴权管理：",
+        lines: [
+          "<code>.img auth set token</code> - 设置手动覆盖 token",
+          "<code>.img auth status</code> - 查看当前鉴权来源",
+          "<code>.img auth clear</code> - 清除手动覆盖 token",
+          "<code>.img help</code> - 查看帮助",
+        ],
+      },
+    ],
+  );
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     img: async (msg) => {

@@ -395,6 +395,18 @@ function renderAnswer(params: {
   return `${header}\n\n${answer}`;
 }
 
+function renderHelpSections(
+  title: string,
+  intro: string,
+  sections: Array<{ heading: string; lines: string[] }>,
+): string {
+  const blocks = [title, "", `<blockquote>${intro}</blockquote>`];
+  for (const section of sections) {
+    blocks.push("", section.heading, `<blockquote>${section.lines.join("\n")}</blockquote>`);
+  }
+  return blocks.join("\n");
+}
+
 function routeLabel(route: RouteKind): string {
   return route === "text" ? "文本路由" : "多模态路由";
 }
@@ -974,24 +986,40 @@ class DsPlugin extends Plugin {
   };
 
   private readonly configStore = new DsConfigStore();
-  private readonly helpLines = [
-    "DS 对话插件",
-    `<code>${mainPrefix}ds [问题]</code> - 直接提问`,
-    `<code>${mainPrefix}ds</code> - 回复文本继续对话，或回复单张静态图片做识别`,
-    `<code>${mainPrefix}ds 这是什么</code> - 回复图片并提问`,
-    `<code>${mainPrefix}ds text use &lt;provider&gt;</code> - 配置文本路由`,
-    `<code>${mainPrefix}ds vision use &lt;provider&gt;</code> - 配置多模态路由`,
-    `<code>${mainPrefix}ds key &lt;provider&gt; &lt;apiKey&gt;</code> - 设置 API Key`,
-    `<code>${mainPrefix}ds model set &lt;provider&gt; &lt;model&gt;</code> - 设置 provider 的单模型`,
-    `<code>${mainPrefix}ds models set &lt;provider&gt; &lt;m1,m2,m3&gt;</code> - 设置 provider 的轮询模型池`,
-    `<code>${mainPrefix}ds status</code> - 查看当前配置`,
-    "",
-    `text providers: ${formatProviderList("text")}`,
-    `vision providers: ${formatProviderList("vision")}`,
-  ];
 
   private renderHelpText(): string {
-    return this.helpLines.join("\n");
+    return renderHelpSections(
+      "🤖 <b>DS 帮助</b>",
+      "对话、识图与多 Provider 模型切换。",
+      [
+        {
+          heading: "📌 基本用法：",
+          lines: [
+            `<code>${mainPrefix}ds [问题]</code> - 直接提问`,
+            `<code>${mainPrefix}ds</code> - 回复文本继续对话，或回复单张静态图片做识别`,
+            `<code>${mainPrefix}ds 这是什么</code> - 回复图片并提问`,
+          ],
+        },
+        {
+          heading: "⚙️ 配置命令：",
+          lines: [
+            `<code>${mainPrefix}ds text use &lt;provider&gt;</code> - 配置文本路由`,
+            `<code>${mainPrefix}ds vision use &lt;provider&gt;</code> - 配置多模态路由`,
+            `<code>${mainPrefix}ds key &lt;provider&gt; &lt;apiKey&gt;</code> - 设置 API Key`,
+            `<code>${mainPrefix}ds model set &lt;provider&gt; &lt;model&gt;</code> - 设置 provider 的单模型`,
+            `<code>${mainPrefix}ds models set &lt;provider&gt; &lt;m1,m2,m3&gt;</code> - 设置 provider 的轮询模型池`,
+            `<code>${mainPrefix}ds status</code> - 查看当前配置`,
+          ],
+        },
+        {
+          heading: "🧭 可用 Provider：",
+          lines: [
+            `text: ${formatProviderList("text")}`,
+            `vision: ${formatProviderList("vision")}`,
+          ],
+        },
+      ],
+    );
   }
 
   get description(): string {
