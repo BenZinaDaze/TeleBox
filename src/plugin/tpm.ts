@@ -194,7 +194,8 @@ async function sendLongMessage(
   msg: Api.Message,
   text: string,
   options?: { parseMode?: string; linkPreview?: boolean },
-  isEdit: boolean = true
+  isEdit: boolean = true,
+  footer?: string
 ): Promise<void> {
   const messages = splitLongText(text);
   
@@ -207,34 +208,33 @@ async function sendLongMessage(
     linkPreview: options?.linkPreview !== false,
   };
 
+  // Append footer to the first message so it always appears at the bottom of the main output
+  const firstMessage = footer ? `${messages[0]}\n${footer}` : messages[0];
+
   if (isEdit) {
     try {
       await msg.edit({
-        text: messages[0],
+        text: firstMessage,
         ...messageOptions,
       });
     } catch (error) {
       await msg.client?.sendMessage(msg.peerId, {
-        message: messages[0],
+        message: firstMessage,
         ...messageOptions,
         replyTo: msg.replyTo?.replyToTopId || msg.replyTo?.replyToMsgId,
       });
     }
   } else {
     await msg.client?.sendMessage(msg.peerId, {
-      message: messages[0],
+      message: firstMessage,
       ...messageOptions,
       replyTo: msg.replyTo?.replyToTopId || msg.replyTo?.replyToMsgId,
     });
   }
 
   for (let i = 1; i < messages.length; i++) {
-    // When there's only one continuation, skip the page number header for cleaner output
-    const header = messages.length === 2
-      ? `📋 <b>续:</b>\n\n`
-      : `📋 <b>续 (${i}/${messages.length - 1}):</b>\n\n`;
     await msg.reply({
-      message: `${header}<blockquote expandable>${messages[i]}</blockquote>`,
+      message: messages[i],
       ...messageOptions,
     });
   }
@@ -1128,11 +1128,11 @@ async function search(msg: Api.Message) {
       "",
       keyword ? `📦 <b>搜索结果:</b>` : `📦 <b>插件详情:</b>`,
       `<blockquote expandable>${pluginLines.join("\n")}</blockquote>`,
-      installTip,
-      repoLink
     ].join("\n");
 
-    await sendLongMessage(statusMsg, fullMessage, { parseMode: "html", linkPreview: false }, true);
+    const footer = installTip + repoLink;
+
+    await sendLongMessage(statusMsg, fullMessage, { parseMode: "html", linkPreview: false }, true, footer);
   } catch (error) {
     console.error("[TPM] 搜索插件失败:", error);
     await sendOrEditMessage(msg, `❌ 搜索插件失败: ${error}`);
@@ -1259,12 +1259,15 @@ async function showPluginRecords(msg: Api.Message, verbose?: boolean) {
       messageParts.push(`<blockquote expandable>${localLines.join("\n")}</blockquote>`);
     }
     
-    messageParts.push("", `━━━━━━━━━━━━━━━━━`);
-    messageParts.push(`📊 总计: ${dbNames.length + notInDb.length} 个插件`);
-    messageParts.push("", `🔗 <b>插件仓库:</b> <a href="https://github.com/TeleBoxOrg/TeleBox_Plugins">TeleBox_Plugins</a>`);
+    const footer = [
+      "",
+      `━━━━━━━━━━━━━━━━━`,
+      `📊 总计: ${dbNames.length + notInDb.length} 个插件`,
+      "", `🔗 <b>插件仓库:</b> <a href="https://github.com/TeleBoxOrg/TeleBox_Plugins">TeleBox_Plugins</a>`,
+    ].join("\n");
     const fullMessage = messageParts.join("\n");
     
-    await sendLongMessage(statusMsg, fullMessage, { parseMode: "html", linkPreview: false }, true);
+    await sendLongMessage(statusMsg, fullMessage, { parseMode: "html", linkPreview: false }, true, footer);
   } catch (error) {
     console.error("[TPM] 读取插件数据库失败:", error);
     await sendOrEditMessage(msg, `❌ 读取数据库失败: ${error}`);
