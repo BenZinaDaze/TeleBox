@@ -879,6 +879,12 @@ function isAbortError(error: unknown): boolean {
   return typeof error === "string" && /aborted|abort/i.test(error);
 }
 
+function isBackfillStatusNote(message?: string | null): boolean {
+  if (!message) return false;
+  return message === "Archive 插件重载后自动续跑中"
+    || message === "手动恢复补抓中";
+}
+
 async function ensureSelfInvocation(
   msg: Api.Message,
   ownerIdCacheRef: { current: string | null }
@@ -1317,7 +1323,13 @@ class ArchivePlugin extends Plugin {
         }
         lines.push(`<b>已处理会话:</b> ${latestJob.processedChats}`);
         lines.push(`<b>已处理消息:</b> ${latestJob.processedMessages}`);
-        if (latestJob.lastError) lines.push(`<b>错误:</b> ${htmlEscape(latestJob.lastError)}`);
+        if (latestJob.lastError) {
+          lines.push(
+            isBackfillStatusNote(latestJob.lastError)
+              ? `<b>提示:</b> ${htmlEscape(latestJob.lastError)}`
+              : `<b>错误:</b> ${htmlEscape(latestJob.lastError)}`
+          );
+        }
       }
 
       await msg.edit({ text: lines.join("\n"), parseMode: "html", linkPreview: false });

@@ -390,7 +390,7 @@ function renderAnswer(params: {
   const answer = formatAiOutput(params.answer);
   const question = params.question?.trim() || "";
   if (question) {
-    return `${escapeHtml(question)}\n\n──────────\n\n${header}\n\n${answer}`;
+    return `💬 ${escapeHtml(question)}\n──────────\n${header}\n${answer}`;
   }
   return `${header}\n\n${answer}`;
 }
@@ -811,24 +811,32 @@ class OpenAICompatProvider {
 
 class DsConfigStore {
   private readonly dbPromise = JSONFilePreset<DsConfig>(CONFIG_PATH, DEFAULT_CONFIG);
+  private cache?: DsConfig;
 
   async get(): Promise<DsConfig> {
+    if (this.cache) {
+      return this.cache;
+    }
+
     const db = await this.dbPromise;
     const normalized = normalizeConfig(db.data);
     if (JSON.stringify(db.data) !== JSON.stringify(normalized)) {
       db.data = normalized;
       await db.write();
     }
-    return normalized;
+    this.cache = normalized;
+    return this.cache;
   }
 
   async update(mutator: (config: DsConfig) => void): Promise<DsConfig> {
     const db = await this.dbPromise;
-    const normalized = normalizeConfig(db.data);
+    const source = this.cache ?? normalizeConfig(db.data);
+    const normalized = normalizeConfig(source);
     mutator(normalized);
     db.data = normalizeConfig(normalized);
     await db.write();
-    return db.data;
+    this.cache = db.data;
+    return this.cache;
   }
 
   async setRouteProvider(route: RouteKind, providerId: string): Promise<DsConfig> {
@@ -980,13 +988,6 @@ class DsPlugin extends Plugin {
     "",
     `text providers: ${formatProviderList("text")}`,
     `vision providers: ${formatProviderList("vision")}`,
-    "",
-    "provider ids",
-    `<code>deepseek</code> / <code>siliconflow</code> / <code>ark</code>`,
-    "",
-    "provider 说明",
-    ...getRouteProviders("text").map((provider) => getRouteProviderDescription("text", provider)),
-    ...getRouteProviders("vision").map((provider) => getRouteProviderDescription("vision", provider)),
   ];
 
   private renderHelpText(): string {
@@ -1202,7 +1203,7 @@ class DsPlugin extends Plugin {
     const client = new OpenAICompatProvider(selection.provider.baseURL, apiKey);
 
     if (context.question) {
-      await safeEditMessage(msg, `${escapeHtml(context.question)}\n\n──────────\n\n思考中…`, "html");
+      await safeEditMessage(msg, `💬 ${escapeHtml(context.question)}\n──────────\n🤔 思考中…`, "html");
     } else {
       await safeEditMessage(msg, `🤖 正在请求 ${selection.provider.displayName} (${selection.model})…`);
     }
