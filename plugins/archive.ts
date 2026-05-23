@@ -18,6 +18,7 @@ const BACKFILL_WAIT_TIME_SECONDS = 1;
 const BACKFILL_BATCH_SIZE = 100;
 const BACKFILL_BATCH_PAUSE_MS = 2000;
 const BACKFILL_DIALOG_PAUSE_MS = 1500;
+const MANUAL_BACKFILL_STOP_REASON = "Archive backfill stopped by command";
 
 type ArchiveRuntimeStats = {
   seenEvents: number;
@@ -108,13 +109,20 @@ interface BackfillJobRecord {
   status: string;
   windowSpec?: string;
   startedAt: number;
-  finishedAt?: number;
+  finishedAt?: number | null;
   currentChatId?: string;
   currentChatTitle?: string;
   cursorMessageId?: number;
   processedChats: number;
   processedMessages: number;
-  lastError?: string;
+  lastError?: string | null;
+}
+
+interface BackfillResumeState {
+  currentChatId?: string;
+  cursorMessageId?: number;
+  processedChats: number;
+  processedMessages: number;
 }
 
 type ExistingMessageRow = {
@@ -478,6 +486,29 @@ class ArchiveDB {
           processed_messages AS processedMessages,
           last_error AS lastError
         FROM backfill_jobs
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .get();
+  }
+
+  public getLatestResumableBackfillJob(): BackfillJobRecord | undefined {
+    return this.db
+      .prepare<[], BackfillJobRecord>(`
+        SELECT
+          id,
+          status,
+          window_spec AS windowSpec,
+          started_at AS startedAt,
+          finished_at AS finishedAt,
+          current_chat_id AS currentChatId,
+          current_chat_title AS currentChatTitle,
+          cursor_message_id AS cursorMessageId,
+          processed_chats AS processedChats,
+          processed_messages AS processedMessages,
+          last_error AS lastError
+        FROM backfill_jobs
+        WHERE status IN ('running', 'aborted')
         ORDER BY id DESC
         LIMIT 1
       `)
@@ -1099,6 +1130,7 @@ class ArchivePlugin extends Plugin {
   name = pluginName;
   private backfillPromise: Promise<void> | null = null;
   private activeJobId: number | null = null;
+  private backfillAbortController: AbortController | null = null;
   private lifecycle: GenerationContext | null = null;
   private ownerIdCache: { current: string | null } = { current: null };
   private runtimeStats: ArchiveRuntimeStats = createRuntimeStats();
@@ -1110,12 +1142,14 @@ class ArchivePlugin extends Plugin {
     const db = new ArchiveDB();
     db.close();
     console.log("[archive] plugin initialized");
+    void this.resumeBackfillIfNeeded();
   }
 
   cleanup(): void {
     this.lifecycle = null;
     this.backfillPromise = null;
     this.activeJobId = null;
+    this.backfillAbortController = null;
     this.ownerIdCache.current = null;
     this.runtimeStats = createRuntimeStats();
   }
@@ -1124,6 +1158,8 @@ class ArchivePlugin extends Plugin {
 <code>${commandName} help</code> 查看帮助
 <code>${commandName} status</code> 查看归档状态
 <code>${commandName} backfill</code> 启动历史补抓
+<code>${commandName} backfill resume</code> 手动恢复最近一次可续跑补抓
+<code>${commandName} backfill stop</code> 停止当前补抓并保留断点
 <code>${commandName} bl</code> 将当前会话加入黑名单（不采集、不搜索）
 <code>${commandName} bl rm</code> 将当前会话移出黑名单
 <code>${commandName} bl list</code> 查看黑名单
@@ -1291,6 +1327,18 @@ class ArchivePlugin extends Plugin {
   }
 
   private async handleBackfill(msg: Api.Message): Promise<void> {
+    const parts = String(msg.message || msg.text || "").trim().split(/\s+/).filter(Boolean);
+    const action = parts[2]?.toLowerCase();
+
+    if (action === "resume") {
+      await this.handleBackfillResume(msg);
+      return;
+    }
+    if (action === "stop") {
+      await this.handleBackfillStop(msg);
+      return;
+    }
+
     const client = await getGlobalClient();
     if (!client) {
       await msg.edit({ text: "❌ Telegram 客户端未初始化" });
@@ -1308,7 +1356,6 @@ class ArchivePlugin extends Plugin {
     let windowSpec: string | undefined;
     let cutoffTs: number | undefined;
     try {
-      const parts = String(msg.message || msg.text || "").trim().split(/\s+/).filter(Boolean);
       ({ windowSpec, cutoffTs } = parseBackfillWindowSpec(parts[2]));
     } catch (error) {
       await msg.edit({ text: `❌ ${htmlEscape(extractErrorMessage(error))}`, parseMode: "html" }).catch(() => undefined);
@@ -1329,15 +1376,149 @@ class ArchivePlugin extends Plugin {
       parseMode: "html",
     });
 
+    this.startBackfillJob(client, jobId, cutoffTs);
+  }
+
+  private startBackfillJob(
+    client: TelegramClient,
+    jobId: number,
+    cutoffTs?: number,
+    resumeState?: BackfillResumeState
+  ): void {
+    if (!this.lifecycle) {
+      throw new Error("Archive 插件生命周期尚未初始化");
+    }
+
+    this.activeJobId = jobId;
+    this.backfillAbortController = new AbortController();
     this.backfillPromise = this.lifecycle.runTask(
-      async (signal) => {
-        await this.runBackfill(client, jobId, signal, cutoffTs);
+      async (lifecycleSignal) => {
+        const signal = AbortSignal.any([lifecycleSignal, this.backfillAbortController!.signal]);
+        await this.runBackfill(client, jobId, signal, cutoffTs, resumeState);
       },
       { label: `archive:backfill:${jobId}`, kind: "promise" }
     ).finally(() => {
       this.backfillPromise = null;
       this.activeJobId = null;
+      this.backfillAbortController = null;
     });
+  }
+
+  private async handleBackfillResume(msg: Api.Message): Promise<void> {
+    if (this.backfillPromise) {
+      await msg.edit({ text: "⚠️ 历史补抓已在运行中" });
+      return;
+    }
+    if (!this.lifecycle) {
+      await msg.edit({ text: "❌ Archive 插件生命周期尚未初始化" });
+      return;
+    }
+
+    const db = new ArchiveDB();
+    let job: BackfillJobRecord | undefined;
+    try {
+      job = db.getLatestBackfillJob();
+      if (!job || !["aborted", "stopped", "failed"].includes(job.status)) {
+        await msg.edit({ text: "ℹ️ 没有可恢复的补抓任务" });
+        return;
+      }
+    } finally {
+      db.close();
+    }
+
+    const resumed = await this.resumeBackfillJob(job, false);
+    if (!resumed) {
+      await msg.edit({ text: "❌ 恢复补抓任务失败，请查看日志" });
+      return;
+    }
+
+    await msg.edit({
+      text: [
+        `▶️ 已恢复历史补抓任务 #${job.id}`,
+        `⏱️ 时间窗口: <code>${htmlEscape(job.windowSpec || "全量")}</code>`,
+        `📍 断点: <code>${htmlEscape(job.currentChatTitle || job.currentChatId || "起点")}</code> / 消息 <code>${job.cursorMessageId || 0}</code>`,
+      ].join("\n"),
+      parseMode: "html",
+    });
+  }
+
+  private async handleBackfillStop(msg: Api.Message): Promise<void> {
+    if (!this.backfillPromise || !this.backfillAbortController || this.activeJobId == null) {
+      await msg.edit({ text: "ℹ️ 当前没有正在运行的补抓任务" });
+      return;
+    }
+
+    const activeJobId = this.activeJobId;
+    this.backfillAbortController.abort(MANUAL_BACKFILL_STOP_REASON);
+
+    try {
+      await this.backfillPromise;
+    } catch {
+      // runBackfill handles abort as a normal state transition.
+    }
+
+    await msg.edit({
+      text: [
+        `⏹️ 已停止历史补抓任务 #${activeJobId}`,
+        `可用 <code>${commandName} backfill resume</code> 从断点继续`,
+      ].join("\n"),
+      parseMode: "html",
+    });
+  }
+
+  private async resumeBackfillIfNeeded(): Promise<void> {
+    if (this.backfillPromise || !this.lifecycle) return;
+
+    const db = new ArchiveDB();
+    let job: BackfillJobRecord | undefined;
+    try {
+      job = db.getLatestResumableBackfillJob();
+    } finally {
+      db.close();
+    }
+    if (!job) return;
+    await this.resumeBackfillJob(job, true);
+  }
+
+  private async resumeBackfillJob(job: BackfillJobRecord, automatic: boolean): Promise<boolean> {
+    let cutoffTs: number | undefined;
+    try {
+      ({ cutoffTs } = parseBackfillWindowSpec(job.windowSpec));
+    } catch (error) {
+      console.error("[archive] Failed to parse resumable backfill window spec:", error);
+      return false;
+    }
+
+    let client: TelegramClient;
+    try {
+      client = await getGlobalClient();
+    } catch (error) {
+      console.error("[archive] Failed to acquire client for backfill resume:", error);
+      return false;
+    }
+
+    const resumeDb = new ArchiveDB();
+    try {
+      resumeDb.updateBackfillJob(job.id, {
+        status: "running",
+        finishedAt: null,
+        lastError: automatic ? "Archive 插件重载后自动续跑中" : "手动恢复补抓中",
+      });
+    } finally {
+      resumeDb.close();
+    }
+
+    console.log(
+      `[archive] resuming backfill job #${job.id} from chat=${job.currentChatId || "start"} cursor=${job.cursorMessageId || 0} processedChats=${job.processedChats} processedMessages=${job.processedMessages}`
+    );
+
+    this.startBackfillJob(client, job.id, cutoffTs, {
+      currentChatId: job.currentChatId,
+      cursorMessageId: job.cursorMessageId,
+      processedChats: job.processedChats,
+      processedMessages: job.processedMessages,
+    });
+    return true;
   }
 
   private async handleBlacklist(msg: Api.Message, args: string[]): Promise<void> {
@@ -1401,14 +1582,19 @@ class ArchivePlugin extends Plugin {
     client: TelegramClient,
     jobId: number,
     signal: AbortSignal,
-    cutoffTs?: number
+    cutoffTs?: number,
+    resumeState?: BackfillResumeState
   ): Promise<void> {
     const db = new ArchiveDB();
-    let processedChats = 0;
-    let processedMessages = 0;
+    let processedChats = resumeState?.processedChats ?? 0;
+    let processedMessages = resumeState?.processedMessages ?? 0;
     let currentChatId: string | undefined;
     let currentChatTitle: string | undefined;
     let cursorMessageId: number | undefined;
+    let remainingCompletedChatsToSkip = Math.max(0, resumeState?.processedChats ?? 0);
+    let pendingResumeChatId = resumeState?.currentChatId;
+    let pendingResumeCursorMessageId = resumeState?.cursorMessageId;
+    let resumeCursorApplied = pendingResumeCursorMessageId == null;
 
     try {
       for await (const dialog of client.iterDialogs({})) {
@@ -1419,6 +1605,12 @@ class ArchivePlugin extends Plugin {
         const entity = dialog.entity as any;
         const chatId = normalizeId(entity?.id);
         if (!chatId) continue;
+
+        if (remainingCompletedChatsToSkip > 0) {
+          remainingCompletedChatsToSkip -= 1;
+          continue;
+        }
+
         currentChatId = chatId;
 
         let chatType: ArchiveChatType = "group";
@@ -1454,16 +1646,32 @@ class ArchivePlugin extends Plugin {
           status: "running",
           currentChatId: chatId,
           currentChatTitle: title,
+          cursorMessageId: pendingResumeCursorMessageId,
           processedChats,
           processedMessages,
         });
 
         let lastMessageId = 0;
+        const iterMessagesOptions: { reverse: true; minId?: number } = { reverse: true };
+        if (!resumeCursorApplied && pendingResumeCursorMessageId != null) {
+          if (!pendingResumeChatId || pendingResumeChatId === chatId) {
+            iterMessagesOptions.minId = pendingResumeCursorMessageId;
+            console.log(
+              `[archive] applying backfill resume cursor for job #${jobId}: chat=${chatId} minId=${pendingResumeCursorMessageId}`
+            );
+          } else {
+            console.warn(
+              `[archive] resume chat mismatch for job #${jobId}: expected ${pendingResumeChatId}, got ${chatId}; replaying chat from the beginning`
+            );
+          }
+          resumeCursorApplied = true;
+          pendingResumeCursorMessageId = undefined;
+          pendingResumeChatId = undefined;
+        }
+
         while (true) {
           try {
-            for await (const message of client.iterMessages(dialog.inputEntity || dialog.entity, {
-              reverse: true,
-            })) {
+            for await (const message of client.iterMessages(dialog.inputEntity || dialog.entity, iterMessagesOptions)) {
               throwIfAborted(signal);
               const messageTs = getDateNumber(message.date);
               if (cutoffTs && messageTs < cutoffTs) {
@@ -1538,6 +1746,7 @@ class ArchivePlugin extends Plugin {
         finishedAt: Date.now(),
         processedChats,
         processedMessages,
+        lastError: null,
       });
     } catch (error) {
       if (isAbortError(error) || signal.aborted) {
@@ -1715,15 +1924,18 @@ class ArchivePlugin extends Plugin {
     context: BackfillAbortContext,
     reason?: unknown
   ): void {
+    const isManualStop = reason === MANUAL_BACKFILL_STOP_REASON;
     db.updateBackfillJob(context.jobId, {
-      status: "aborted",
+      status: isManualStop ? "stopped" : "aborted",
       finishedAt: Date.now(),
       currentChatId: context.currentChatId,
       currentChatTitle: context.currentChatTitle,
       cursorMessageId: context.cursorMessageId,
       processedChats: context.processedChats,
       processedMessages: context.processedMessages,
-      lastError: extractErrorMessage(reason || "Runtime reload aborted archive backfill"),
+      lastError: extractErrorMessage(
+        reason || (isManualStop ? MANUAL_BACKFILL_STOP_REASON : "Runtime reload aborted archive backfill")
+      ),
     });
   }
 }
