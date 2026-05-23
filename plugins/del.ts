@@ -4,7 +4,7 @@ import { safeGetMe } from "@utils/authGuards";
 import { Api } from "teleproto";
 
 const MAX_BULK_DELETE_COUNT = 100;
-const FEEDBACK_DELETE_DELAY_MS = 5000;
+const FEEDBACK_DELETE_DELAY_MS = 3000;
 
 type DeletableMessage = Api.Message & {
   safeDelete?: (options?: { revoke?: boolean }) => Promise<Api.messages.AffectedMessages[] | undefined>;
@@ -154,6 +154,8 @@ async function deleteBulkMessagesFlow(msg: Api.Message, count: number): Promise<
     return;
   }
 
+  await trySafeDelete(msg);
+
   let deletedCount = 0;
   for (const target of targets) {
     if (await trySafeDelete(target)) {
@@ -161,7 +163,6 @@ async function deleteBulkMessagesFlow(msg: Api.Message, count: number): Promise<
     }
   }
 
-  await trySafeDelete(msg);
   await sendTemporaryFeedback(msg, `已删除最近 ${deletedCount} 条本人消息`);
 }
 
