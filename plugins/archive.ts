@@ -489,25 +489,6 @@ class ArchivePlugin extends Plugin {
     return target.username ? `@${target.username}` : target.chatId;
   }
 
-  private async buildNormalizationAliasMap(client: TelegramClient): Promise<Map<string, string>> {
-    const aliasMap = new Map<string, string>();
-    for await (const dialog of client.iterDialogs({})) {
-      if (!dialog?.entity) continue;
-      if (!dialog.isGroup && !dialog.isChannel) continue;
-      const entity = dialog.entity as Api.Channel | Api.Chat;
-      const chatType = getChatTypeFromEntity(entity) || (dialog.isChannel ? "channel" : "group");
-      if (chatType === "channel") continue;
-      const canonicalChatId = getMarkedPeerId(dialog.inputEntity)
-        || getMarkedPeerId(entity)
-        || toCanonicalChatId(chatType, dialog.id, entity.id);
-      if (!canonicalChatId) continue;
-      for (const candidate of collectChatIdCandidates(chatType, canonicalChatId, dialog.id, entity.id)) {
-        aliasMap.set(candidate, canonicalChatId);
-      }
-    }
-    return aliasMap;
-  }
-
   private async listAvailableBackfillDialogs(client: TelegramClient, db: ArchiveDB): Promise<BackfillDialogOption[]> {
     const dialogs: BackfillDialogOption[] = [];
     for await (const dialog of client.iterDialogs({})) {
@@ -643,13 +624,11 @@ class ArchivePlugin extends Plugin {
       return;
     }
 
-    await msg.edit({ text: "⏳ 正在归一化 Archive chatId，请稍候..." }).catch(() => undefined);
+    await msg.edit({ text: "⏳ 正在从旧 DB 迁移到新 DB，请稍候..." }).catch(() => undefined);
 
-    const client = await getGlobalClient();
-    const aliasMap = await this.buildNormalizationAliasMap(client);
     const db = new ArchiveDB();
     try {
-      const stats = db.normalizeChatIds(aliasMap);
+      const stats = db.normalizeChatIds(new Map());
       await msg.edit({
         text: this.formatNormalizationStats(stats),
         parseMode: "html",
