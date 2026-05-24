@@ -157,6 +157,7 @@ const BACKFILL_TARGET_SELECT = `
 const ARCHIVE_DIR = createDirectoryInAssets("archive");
 const LEGACY_DB_PATH = path.join(ARCHIVE_DIR, "archive.db");
 const V2_DB_PATH = path.join(ARCHIVE_DIR, "archive_v2.db");
+const LEGACY_MIGRATION_BATCH_SIZE = 1000;
 
 function rowCount(db: Database.Database, tableName: string): boolean {
   const row = db
@@ -816,8 +817,14 @@ export class ArchiveDB {
         stats.backfillJobsUpdated = row.count;
       }
 
-      await emit("messages", "读取旧消息与版本");
-      const legacyMessages = legacy.prepare<[], LegacyMessageRow>(`
+      const totalMessagesRow = legacy.prepare(`
+        SELECT COUNT(*) AS count
+        FROM messages
+      `).get() as { count: number };
+      const totalMessages = totalMessagesRow.count;
+      await emit("messages", `开始迁移，共 ${totalMessages} 条旧消息`);
+
+      const fetchLegacyMessages = legacy.prepare<[number, number], LegacyMessageRow>(`
         SELECT
           id,
           chat_id,
@@ -831,82 +838,90 @@ export class ArchiveDB {
           link,
           is_deleted
         FROM messages
+        WHERE id > ?
         ORDER BY id ASC
-      `).all();
+        LIMIT ?
+      `);
 
-      const versionsByMessageRowId = new Map<number, LegacyMessageVersionRow[]>();
-      if (hasVersions) {
-        const rows = legacy.prepare<[], LegacyMessageVersionRow>(`
-          SELECT
-            message_row_id,
-            version,
-            raw_text,
-            text_normalized,
-            caption,
-            edited_at
-          FROM message_versions
-          ORDER BY message_row_id ASC, version ASC, edited_at ASC
-        `).all();
-        for (const row of rows) {
-          const bucket = versionsByMessageRowId.get(row.message_row_id) || [];
-          bucket.push(row);
-          versionsByMessageRowId.set(row.message_row_id, bucket);
-        }
-      }
+      const seenChats = new Set<string>();
+      let lastMessageRowId = 0;
+      while (true) {
+        const legacyMessages = fetchLegacyMessages.all(lastMessageRowId, LEGACY_MIGRATION_BATCH_SIZE);
+        if (legacyMessages.length === 0) break;
+        lastMessageRowId = legacyMessages[legacyMessages.length - 1].id;
 
-      const seenMessages = new Set<string>();
-      await emit("messages", `开始迁移 ${legacyMessages.length} 条旧消息`);
-      for (const row of legacyMessages) {
-        const chatId = resolveCanonicalChatId(row.chat_id, typeHints.get(row.chat_id));
-        if (droppedChannelChatIds.has(chatId)) {
-          stats.droppedChannelMessages += 1;
-          stats.droppedChannelVersions += (versionsByMessageRowId.get(row.id) || []).length;
-          continue;
+        const versionsByMessageRowId = new Map<number, LegacyMessageVersionRow[]>();
+        if (hasVersions) {
+          const placeholders = legacyMessages.map(() => "?").join(", ");
+          const rows = legacy.prepare<number[], LegacyMessageVersionRow>(`
+            SELECT
+              message_row_id,
+              version,
+              raw_text,
+              text_normalized,
+              caption,
+              edited_at
+            FROM message_versions
+            WHERE message_row_id IN (${placeholders})
+            ORDER BY message_row_id ASC, version ASC, edited_at ASC
+          `).all(...legacyMessages.map((row) => row.id));
+          for (const row of rows) {
+            const bucket = versionsByMessageRowId.get(row.message_row_id) || [];
+            bucket.push(row);
+            versionsByMessageRowId.set(row.message_row_id, bucket);
+          }
         }
-        seenMessages.add(`${chatId}\u0000${row.message_id}`);
-        const versions = versionsByMessageRowId.get(row.id) || [];
-        if (versions.length === 0) {
-          this.insertOrUpdateMessage({
-            chatId,
-            messageId: row.message_id,
-            senderId: row.sender_id || undefined,
-            date: row.date,
-            editDate: row.date,
-            rawText: row.raw_text,
-            textNormalized: row.text_normalized,
-            messageType: row.message_type,
-            caption: row.caption || undefined,
-            link: row.link || undefined,
-          }, "backfill");
-          if (row.is_deleted) this.markMessageDeleted(chatId, row.message_id);
-          stats.messageRowsRewritten += 1;
-          stats.versionRowsRewritten += 1;
-        } else {
-          for (const version of versions) {
-            const effectiveEditDate = version.version === 1 ? row.date : Math.max(version.edited_at, row.date);
+
+        for (const row of legacyMessages) {
+          const chatId = resolveCanonicalChatId(row.chat_id, typeHints.get(row.chat_id));
+          if (droppedChannelChatIds.has(chatId)) {
+            stats.droppedChannelMessages += 1;
+            stats.droppedChannelVersions += (versionsByMessageRowId.get(row.id) || []).length;
+            continue;
+          }
+          seenChats.add(chatId);
+          const versions = versionsByMessageRowId.get(row.id) || [];
+          if (versions.length === 0) {
             this.insertOrUpdateMessage({
               chatId,
               messageId: row.message_id,
               senderId: row.sender_id || undefined,
               date: row.date,
-              editDate: effectiveEditDate,
-              rawText: version.raw_text,
-              textNormalized: version.text_normalized,
+              editDate: row.date,
+              rawText: row.raw_text,
+              textNormalized: row.text_normalized,
               messageType: row.message_type,
-              caption: version.caption || undefined,
+              caption: row.caption || undefined,
               link: row.link || undefined,
             }, "backfill");
+            if (row.is_deleted) this.markMessageDeleted(chatId, row.message_id);
+            stats.messageRowsRewritten += 1;
             stats.versionRowsRewritten += 1;
+          } else {
+            for (const version of versions) {
+              const effectiveEditDate = version.version === 1 ? row.date : Math.max(version.edited_at, row.date);
+              this.insertOrUpdateMessage({
+                chatId,
+                messageId: row.message_id,
+                senderId: row.sender_id || undefined,
+                date: row.date,
+                editDate: effectiveEditDate,
+                rawText: version.raw_text,
+                textNormalized: version.text_normalized,
+                messageType: row.message_type,
+                caption: version.caption || undefined,
+                link: row.link || undefined,
+              }, "backfill");
+              stats.versionRowsRewritten += 1;
+            }
+            if (row.is_deleted) this.markMessageDeleted(chatId, row.message_id);
+            stats.messageRowsRewritten += 1;
           }
-          if (row.is_deleted) this.markMessageDeleted(chatId, row.message_id);
-          stats.messageRowsRewritten += 1;
         }
-        if (stats.messageRowsRewritten > 0 && stats.messageRowsRewritten % 200 === 0) {
-          await emit("messages", `已迁移 ${stats.messageRowsRewritten}/${legacyMessages.length} 条消息`);
-        }
+        await emit("messages", `已迁移 ${stats.messageRowsRewritten}/${totalMessages} 条消息`);
       }
 
-      stats.chatsRewritten = new Set(Array.from(seenMessages, (value) => value.split("\u0000")[0])).size;
+      stats.chatsRewritten = seenChats.size;
       await emit("done", `迁移完成，共 ${stats.messageRowsRewritten} 条消息，${stats.versionRowsRewritten} 个版本`);
       return stats;
     } finally {
