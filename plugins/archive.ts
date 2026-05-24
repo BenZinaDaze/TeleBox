@@ -2,10 +2,23 @@ import { Plugin, type PluginRuntimeContext } from "@utils/pluginBase";
 import { getPrefixes } from "@utils/pluginManager";
 import { getGlobalClient } from "@utils/globalClient";
 import { safeGetMe } from "@utils/authGuards";
+import {
+  ArchiveDB,
+  type ArchiveSearchParams,
+  type ArchiveSearchRow,
+  type ArchiveStats,
+  type BackfillTargetRecord,
+  type BackfillTargetStatus,
+} from "@utils/archiveDb";
+import {
+  buildArchiveInput,
+  getDateNumber,
+  normalizeId,
+  resolveChatContext,
+  type ArchiveChatType,
+  type ArchiveMessageInput,
+} from "@utils/archiveMessageBuilder";
 import type { GenerationContext } from "@utils/generationContext";
-import Database from "better-sqlite3";
-import path from "path";
-import { createDirectoryInAssets } from "@utils/pathHelpers";
 import { Api, TelegramClient } from "teleproto";
 
 const prefixes = getPrefixes();
@@ -14,10 +27,9 @@ const pluginName = "archive";
 const commandName = `${mainPrefix}${pluginName}`;
 const MAX_RESULT_COUNT = 20;
 const MAX_CHUNK_LENGTH = 3500;
-const BACKFILL_WAIT_TIME_SECONDS = 1;
+const BACKFILL_LIST_PAGE_SIZE = 10;
 const BACKFILL_BATCH_SIZE = 100;
 const BACKFILL_BATCH_PAUSE_MS = 2000;
-const BACKFILL_DIALOG_PAUSE_MS = 1500;
 const MANUAL_BACKFILL_STOP_REASON = "Archive backfill stopped by command";
 
 type ArchiveRuntimeStats = {
@@ -28,6 +40,28 @@ type ArchiveRuntimeStats = {
   lastStoredAt: number;
   lastSkipReason: string;
   lastError: string;
+};
+
+type BackfillAbortContext = {
+  chatId: string;
+  title: string;
+  cursorMessageId?: number;
+  processedMessages: number;
+};
+
+interface BackfillDialogOption {
+  chatId: string;
+  title: string;
+  username?: string;
+  chatType: ArchiveChatType;
+  inputEntity: any;
+}
+
+type ActiveBackfillRuntime = {
+  chatId: string;
+  title: string;
+  processedMessages: number;
+  cursorMessageId?: number;
 };
 
 function createRuntimeStats(): ArchiveRuntimeStats {
@@ -54,633 +88,6 @@ function renderHelpSections(
   return blocks.join("\n");
 }
 
-type BackfillAbortContext = {
-  jobId: number;
-  processedChats: number;
-  processedMessages: number;
-  currentChatId?: string;
-  currentChatTitle?: string;
-  cursorMessageId?: number;
-};
-
-type ArchiveChatType = "group" | "supergroup" | "channel";
-
-interface ArchiveMessageInput {
-  chatId: string;
-  messageId: number;
-  senderId?: string;
-  senderDisplay?: string;
-  date: number;
-  rawText: string;
-  textNormalized: string;
-  messageType: string;
-  caption?: string;
-  replyToMsgId?: number;
-  groupedId?: string;
-  link?: string;
-}
-
-interface ArchiveSearchParams {
-  keyword?: string;
-  chatId?: string;
-  senderId?: string;
-  fromTs?: number;
-  toTs?: number;
-  limit: number;
-}
-
-interface ArchiveSearchRow {
-  chatId: string;
-  messageId: number;
-  senderId?: string;
-  senderDisplay?: string;
-  chatTitle: string;
-  chatUsername?: string;
-  date: number;
-  rawText: string;
-  textNormalized: string;
-  messageType: string;
-  caption?: string;
-  link?: string;
-  latestVersion: number;
-  isDeleted: number;
-}
-
-interface ArchiveStats {
-  chats: number;
-  users: number;
-  messages: number;
-  versions: number;
-  deletedMessages: number;
-  blacklistedChats: number;
-  dbSizeBytes: number;
-}
-
-interface BackfillJobRecord {
-  id: number;
-  status: string;
-  windowSpec?: string;
-  startedAt: number;
-  finishedAt?: number | null;
-  currentChatId?: string;
-  currentChatTitle?: string;
-  cursorMessageId?: number;
-  processedChats: number;
-  processedMessages: number;
-  lastError?: string | null;
-}
-
-interface BackfillResumeState {
-  currentChatId?: string;
-  cursorMessageId?: number;
-  processedChats: number;
-  processedMessages: number;
-}
-
-type ExistingMessageRow = {
-  id: number;
-  latest_version: number;
-  raw_text: string;
-  text_normalized: string;
-  caption: string | null;
-  sender_id: string | null;
-  sender_display: string | null;
-  message_type: string;
-  date: number;
-  reply_to_msg_id: number | null;
-  grouped_id: string | null;
-  link: string | null;
-  is_deleted: number;
-};
-
-class ArchiveDB {
-  private db: Database.Database;
-
-  constructor(
-    dbPath: string = path.join(createDirectoryInAssets("archive"), "archive.db")
-  ) {
-    this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("synchronous = NORMAL");
-    this.init();
-  }
-
-  private init(): void {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS chats (
-        chat_id TEXT PRIMARY KEY,
-        chat_type TEXT NOT NULL,
-        title TEXT NOT NULL,
-        username TEXT,
-        last_seen_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS users (
-        user_id TEXT PRIMARY KEY,
-        username TEXT,
-        display_name TEXT NOT NULL,
-        last_seen_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT NOT NULL,
-        message_id INTEGER NOT NULL,
-        sender_id TEXT,
-        sender_display TEXT,
-        date INTEGER NOT NULL,
-        raw_text TEXT NOT NULL,
-        text_normalized TEXT NOT NULL,
-        message_type TEXT NOT NULL,
-        caption TEXT,
-        reply_to_msg_id INTEGER,
-        grouped_id TEXT,
-        link TEXT,
-        is_deleted INTEGER NOT NULL DEFAULT 0,
-        latest_version INTEGER NOT NULL DEFAULT 1,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        UNIQUE(chat_id, message_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS message_versions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        message_row_id INTEGER NOT NULL,
-        version INTEGER NOT NULL,
-        raw_text TEXT NOT NULL,
-        text_normalized TEXT NOT NULL,
-        caption TEXT,
-        edited_at INTEGER NOT NULL,
-        edit_source TEXT NOT NULL,
-        UNIQUE(message_row_id, version)
-      );
-
-      CREATE TABLE IF NOT EXISTS backfill_jobs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        status TEXT NOT NULL,
-        window_spec TEXT,
-        started_at INTEGER NOT NULL,
-        finished_at INTEGER,
-        current_chat_id TEXT,
-        current_chat_title TEXT,
-        cursor_message_id INTEGER,
-        processed_chats INTEGER NOT NULL DEFAULT 0,
-        processed_messages INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS archive_blacklist (
-        chat_id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        username TEXT,
-        created_at INTEGER NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date DESC);
-      CREATE INDEX IF NOT EXISTS idx_messages_sender_date ON messages(sender_id, date DESC);
-      CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date DESC);
-      CREATE INDEX IF NOT EXISTS idx_versions_message_version ON message_versions(message_row_id, version DESC);
-
-      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-        search_text,
-        tokenize='trigram'
-      );
-    `);
-    const columns = this.db.prepare(`PRAGMA table_info(backfill_jobs)`).all() as Array<{ name: string }>;
-    if (!columns.some((column) => column.name === "window_spec")) {
-      this.db.exec(`ALTER TABLE backfill_jobs ADD COLUMN window_spec TEXT`);
-    }
-  }
-
-  private buildSearchText(input: ArchiveMessageInput): string {
-    return [
-      input.textNormalized,
-      input.caption || "",
-      input.senderDisplay || "",
-      input.messageType || "",
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  public upsertChat(record: {
-    chatId: string;
-    chatType: ArchiveChatType;
-    title: string;
-    username?: string;
-    lastSeenAt: number;
-  }): void {
-    this.db
-      .prepare(`
-        INSERT INTO chats (chat_id, chat_type, title, username, last_seen_at)
-        VALUES (@chatId, @chatType, @title, @username, @lastSeenAt)
-        ON CONFLICT(chat_id) DO UPDATE SET
-          chat_type = excluded.chat_type,
-          title = excluded.title,
-          username = excluded.username,
-          last_seen_at = excluded.last_seen_at
-      `)
-      .run(record);
-  }
-
-  public upsertUser(record: {
-    userId: string;
-    username?: string;
-    displayName: string;
-    lastSeenAt: number;
-  }): void {
-    this.db
-      .prepare(`
-        INSERT INTO users (user_id, username, display_name, last_seen_at)
-        VALUES (@userId, @username, @displayName, @lastSeenAt)
-        ON CONFLICT(user_id) DO UPDATE SET
-          username = excluded.username,
-          display_name = excluded.display_name,
-          last_seen_at = excluded.last_seen_at
-      `)
-      .run(record);
-  }
-
-  public insertOrUpdateMessage(
-    input: ArchiveMessageInput,
-    editSource: "new" | "edit" | "backfill" = "new"
-  ): { inserted: boolean; updated: boolean; version: number } {
-    const now = Date.now();
-    const existing = this.db
-      .prepare<[string, number], ExistingMessageRow>(`
-        SELECT *
-        FROM messages
-        WHERE chat_id = ? AND message_id = ?
-      `)
-      .get(input.chatId, input.messageId);
-
-    if (!existing) {
-      const result = this.db
-        .prepare(`
-          INSERT INTO messages (
-            chat_id, message_id, sender_id, sender_display, date,
-            raw_text, text_normalized, message_type, caption,
-            reply_to_msg_id, grouped_id, link, is_deleted, latest_version,
-            created_at, updated_at
-          ) VALUES (
-            @chatId, @messageId, @senderId, @senderDisplay, @date,
-            @rawText, @textNormalized, @messageType, @caption,
-            @replyToMsgId, @groupedId, @link, 0, 1,
-            @createdAt, @updatedAt
-          )
-        `)
-        .run({
-          ...input,
-          createdAt: now,
-          updatedAt: now,
-        });
-
-      const rowId = Number(result.lastInsertRowid);
-      this.db
-        .prepare(`
-          INSERT INTO message_versions (
-            message_row_id, version, raw_text, text_normalized, caption, edited_at, edit_source
-          ) VALUES (?, 1, ?, ?, ?, ?, ?)
-        `)
-        .run(
-          rowId,
-          input.rawText,
-          input.textNormalized,
-          input.caption || null,
-          now,
-          editSource
-        );
-
-      this.replaceFtsRow(rowId, this.buildSearchText(input));
-      return { inserted: true, updated: false, version: 1 };
-    }
-
-    const changed =
-      existing.raw_text !== input.rawText ||
-      existing.text_normalized !== input.textNormalized ||
-      (existing.caption || "") !== (input.caption || "") ||
-      (existing.sender_id || "") !== (input.senderId || "") ||
-      (existing.sender_display || "") !== (input.senderDisplay || "") ||
-      existing.message_type !== input.messageType ||
-      existing.date !== input.date ||
-      (existing.reply_to_msg_id || 0) !== (input.replyToMsgId || 0) ||
-      (existing.grouped_id || "") !== (input.groupedId || "") ||
-      (existing.link || "") !== (input.link || "") ||
-      existing.is_deleted !== 0;
-
-    const nextVersion = changed ? existing.latest_version + 1 : existing.latest_version;
-
-    this.db
-      .prepare(`
-        UPDATE messages
-        SET sender_id = @senderId,
-            sender_display = @senderDisplay,
-            date = @date,
-            raw_text = @rawText,
-            text_normalized = @textNormalized,
-            message_type = @messageType,
-            caption = @caption,
-            reply_to_msg_id = @replyToMsgId,
-            grouped_id = @groupedId,
-            link = @link,
-            is_deleted = 0,
-            latest_version = @latestVersion,
-            updated_at = @updatedAt
-        WHERE id = @id
-      `)
-      .run({
-        ...input,
-        id: existing.id,
-        latestVersion: nextVersion,
-        updatedAt: now,
-      });
-
-    if (changed) {
-      this.db
-        .prepare(`
-          INSERT INTO message_versions (
-            message_row_id, version, raw_text, text_normalized, caption, edited_at, edit_source
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        `)
-        .run(
-          existing.id,
-          nextVersion,
-          input.rawText,
-          input.textNormalized,
-          input.caption || null,
-          now,
-          editSource
-        );
-      this.replaceFtsRow(existing.id, this.buildSearchText(input));
-    }
-
-    return { inserted: false, updated: changed, version: nextVersion };
-  }
-
-  public markMessageDeleted(chatId: string, messageId: number): void {
-    const row = this.db
-      .prepare<[string, number], { id: number }>(`
-        SELECT id
-        FROM messages
-        WHERE chat_id = ? AND message_id = ?
-      `)
-      .get(chatId, messageId);
-
-    if (!row) return;
-
-    this.db
-      .prepare(`
-        UPDATE messages
-        SET is_deleted = 1, updated_at = ?
-        WHERE id = ?
-      `)
-      .run(Date.now(), row.id);
-    this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(row.id);
-  }
-
-  private replaceFtsRow(rowId: number, searchText: string): void {
-    this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(rowId);
-    this.db
-      .prepare(`INSERT INTO messages_fts(rowid, search_text) VALUES (?, ?)`)
-      .run(rowId, searchText);
-  }
-
-  public createBackfillJob(windowSpec?: string): number {
-    const result = this.db
-      .prepare(`
-        INSERT INTO backfill_jobs (status, window_spec, started_at)
-        VALUES ('running', ?, ?)
-      `)
-      .run(windowSpec || null, Date.now());
-    return Number(result.lastInsertRowid);
-  }
-
-  public updateBackfillJob(jobId: number, patch: Partial<BackfillJobRecord>): void {
-    const fields: string[] = [];
-    const values: Array<string | number | null> = [];
-    const mapping: Record<string, string> = {
-      status: "status",
-      finishedAt: "finished_at",
-      currentChatId: "current_chat_id",
-      currentChatTitle: "current_chat_title",
-      cursorMessageId: "cursor_message_id",
-      processedChats: "processed_chats",
-      processedMessages: "processed_messages",
-      lastError: "last_error",
-    };
-
-    for (const [key, column] of Object.entries(mapping)) {
-      const value = patch[key as keyof BackfillJobRecord];
-      if (value !== undefined) {
-        fields.push(`${column} = ?`);
-        values.push(value as string | number | null);
-      }
-    }
-
-    if (fields.length === 0) return;
-    values.push(jobId);
-    this.db.prepare(`UPDATE backfill_jobs SET ${fields.join(", ")} WHERE id = ?`).run(...values);
-  }
-
-  public getLatestBackfillJob(): BackfillJobRecord | undefined {
-    return this.db
-      .prepare<[], BackfillJobRecord>(`
-        SELECT
-          id,
-          status,
-          window_spec AS windowSpec,
-          started_at AS startedAt,
-          finished_at AS finishedAt,
-          current_chat_id AS currentChatId,
-          current_chat_title AS currentChatTitle,
-          cursor_message_id AS cursorMessageId,
-          processed_chats AS processedChats,
-          processed_messages AS processedMessages,
-          last_error AS lastError
-        FROM backfill_jobs
-        ORDER BY id DESC
-        LIMIT 1
-      `)
-      .get();
-  }
-
-  public getLatestResumableBackfillJob(): BackfillJobRecord | undefined {
-    return this.db
-      .prepare<[], BackfillJobRecord>(`
-        SELECT
-          id,
-          status,
-          window_spec AS windowSpec,
-          started_at AS startedAt,
-          finished_at AS finishedAt,
-          current_chat_id AS currentChatId,
-          current_chat_title AS currentChatTitle,
-          cursor_message_id AS cursorMessageId,
-          processed_chats AS processedChats,
-          processed_messages AS processedMessages,
-          last_error AS lastError
-        FROM backfill_jobs
-        WHERE status IN ('running', 'aborted')
-        ORDER BY id DESC
-        LIMIT 1
-      `)
-      .get();
-  }
-
-  public getStats(): ArchiveStats {
-    const chats = this.db.prepare(`SELECT COUNT(*) AS count FROM chats`).get() as { count: number };
-    const users = this.db.prepare(`SELECT COUNT(*) AS count FROM users`).get() as { count: number };
-    const messages = this.db.prepare(`SELECT COUNT(*) AS count FROM messages`).get() as { count: number };
-    const versions = this.db.prepare(`SELECT COUNT(*) AS count FROM message_versions`).get() as { count: number };
-    const deleted = this.db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE is_deleted = 1`).get() as {
-      count: number;
-    };
-    const blacklisted = this.db.prepare(`SELECT COUNT(*) AS count FROM archive_blacklist`).get() as {
-      count: number;
-    };
-    const pageCount = this.db.pragma("page_count", { simple: true }) as number;
-    const pageSize = this.db.pragma("page_size", { simple: true }) as number;
-
-    return {
-      chats: chats.count,
-      users: users.count,
-      messages: messages.count,
-      versions: versions.count,
-      deletedMessages: deleted.count,
-      blacklistedChats: blacklisted.count,
-      dbSizeBytes: pageCount * pageSize,
-    };
-  }
-
-  public searchMessages(params: ArchiveSearchParams): ArchiveSearchRow[] {
-    const where: string[] = [
-      `m.is_deleted = 0`,
-      `NOT EXISTS (SELECT 1 FROM archive_blacklist bl WHERE bl.chat_id = m.chat_id)`,
-    ];
-    const values: Array<string | number> = [];
-    let fromClause = `messages m`;
-
-    if (params.keyword) {
-      const keyword = params.keyword.trim();
-      if (keyword.length >= 3) {
-        fromClause = `messages_fts f JOIN messages m ON m.id = f.rowid`;
-        where.push(`f.search_text MATCH ?`);
-        values.push(keyword);
-      } else {
-        where.push(`m.text_normalized LIKE ?`);
-        values.push(`%${keyword}%`);
-      }
-    }
-
-    if (params.chatId) {
-      where.push(`m.chat_id = ?`);
-      values.push(params.chatId);
-    }
-    if (params.senderId) {
-      where.push(`m.sender_id = ?`);
-      values.push(params.senderId);
-    }
-    if (params.fromTs) {
-      where.push(`m.date >= ?`);
-      values.push(params.fromTs);
-    }
-    if (params.toTs) {
-      where.push(`m.date <= ?`);
-      values.push(params.toTs);
-    }
-
-    values.push(params.limit);
-    return this.db.prepare(`
-      SELECT
-        m.chat_id AS chatId,
-        m.message_id AS messageId,
-        m.sender_id AS senderId,
-        m.sender_display AS senderDisplay,
-        c.title AS chatTitle,
-        c.username AS chatUsername,
-        m.date,
-        m.raw_text AS rawText,
-        m.text_normalized AS textNormalized,
-        m.message_type AS messageType,
-        m.caption,
-        m.link,
-        m.latest_version AS latestVersion,
-        m.is_deleted AS isDeleted
-      FROM ${fromClause}
-      LEFT JOIN chats c ON c.chat_id = m.chat_id
-      WHERE ${where.join(" AND ")}
-      ORDER BY m.date DESC
-      LIMIT ?
-    `).all(...values) as ArchiveSearchRow[];
-  }
-
-  public close(): void {
-    this.db.close();
-  }
-
-  public isChatBlacklisted(chatId: string): boolean {
-    const row = this.db
-      .prepare<[string], { found: number }>(`
-        SELECT 1 AS found
-        FROM archive_blacklist
-        WHERE chat_id = ?
-        LIMIT 1
-      `)
-      .get(chatId);
-    return !!row;
-  }
-
-  public addChatBlacklist(record: {
-    chatId: string;
-    title: string;
-    username?: string;
-  }): void {
-    this.db
-      .prepare(`
-        INSERT INTO archive_blacklist (chat_id, title, username, created_at)
-        VALUES (@chatId, @title, @username, @createdAt)
-        ON CONFLICT(chat_id) DO UPDATE SET
-          title = excluded.title,
-          username = excluded.username
-      `)
-      .run({
-        ...record,
-        createdAt: Date.now(),
-      });
-  }
-
-  public removeChatBlacklist(chatId: string): boolean {
-    const result = this.db
-      .prepare(`DELETE FROM archive_blacklist WHERE chat_id = ?`)
-      .run(chatId);
-    return result.changes > 0;
-  }
-
-  public listBlacklistedChats(): Array<{
-    chatId: string;
-    title: string;
-    username?: string;
-    createdAt: number;
-  }> {
-    return this.db
-      .prepare<[], {
-        chatId: string;
-        title: string;
-        username?: string;
-        createdAt: number;
-      }>(`
-        SELECT
-          chat_id AS chatId,
-          title,
-          username,
-          created_at AS createdAt
-        FROM archive_blacklist
-        ORDER BY created_at DESC
-      `)
-      .all();
-  }
-}
-
 type CommandFilters = {
   keyword?: string;
   chat?: string;
@@ -697,45 +104,6 @@ function htmlEscape(text: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
-}
-
-function normalizeText(text: string): string {
-  return text
-    .replace(/\s*\r?\n\s*/g, " / ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function normalizeId(value: unknown): string | undefined {
-  if (value === null || value === undefined) return undefined;
-  if (typeof value === "string" || typeof value === "number" || typeof value === "bigint") {
-    return String(value);
-  }
-  if (
-    typeof value === "object"
-    && value
-    && typeof (value as { toString?: () => string }).toString === "function"
-  ) {
-    const stringified = (value as { toString: () => string }).toString();
-    if (stringified && stringified !== "[object Object]") {
-      return stringified;
-    }
-  }
-  if (typeof value !== "object") return undefined;
-  const record = value as Record<string, unknown>;
-  for (const key of ["userId", "chatId", "channelId", "senderId", "id"]) {
-    const nested = normalizeId(record[key]);
-    if (nested) return nested;
-  }
-  return undefined;
-}
-
-function getDateNumber(input: unknown): number {
-  if (input instanceof Date) return input.getTime();
-  if (typeof input === "number") return input > 10_000_000_000 ? input : input * 1000;
-  if (typeof input === "bigint") return Number(input) * 1000;
-  return Date.now();
 }
 
 function formatTime(ts: number): string {
@@ -767,6 +135,10 @@ function buildExpandableBlockquote(lines: string[]): string {
   return `<blockquote expandable>${lines.join("\n\n")}</blockquote>`;
 }
 
+function canUseFtsKeyword(keyword: string): boolean {
+  return /^[\p{L}\p{N}\s_-]+$/u.test(keyword);
+}
+
 function getFloodWaitMs(error: unknown): number | null {
   const message = extractErrorMessage(error);
   const match = /FLOOD(?:_PREMIUM)?_WAIT_(\d+)/.exec(message) || /A wait of (\d+) seconds/i.exec(message);
@@ -774,55 +146,6 @@ function getFloodWaitMs(error: unknown): number | null {
   const seconds = parseInt(match[1], 10);
   if (!Number.isFinite(seconds) || seconds <= 0) return null;
   return (seconds + 1) * 1000;
-}
-
-function parseBackfillWindowSpec(input?: string): { windowSpec?: string; cutoffTs?: number } {
-  if (!input) return {};
-  const match = /^(\d+)(d|h|min)$/.exec(input.trim());
-  if (!match) {
-    throw new Error(
-      `时间窗口格式错误: ${input}\n支持格式: 3d / 5h / 10min\n示例: ${commandName} backfill 1d`
-    );
-  }
-
-  const amount = parseInt(match[1], 10);
-  if (!Number.isFinite(amount) || amount <= 0) {
-    throw new Error(
-      `时间窗口格式错误: ${input}\n数值必须大于 0，支持格式: 3d / 5h / 10min`
-    );
-  }
-
-  const unit = match[2];
-  let durationMs = 0;
-  if (unit === "d") durationMs = amount * 24 * 60 * 60 * 1000;
-  else if (unit === "h") durationMs = amount * 60 * 60 * 1000;
-  else durationMs = amount * 60 * 1000;
-
-  return {
-    windowSpec: `${amount}${unit}`,
-    cutoffTs: Date.now() - durationMs,
-  };
-}
-
-function buildEntityDisplay(entity: any, fallback: string): string {
-  const parts: string[] = [];
-  if (entity?.title) parts.push(String(entity.title));
-  if (entity?.firstName) parts.push(String(entity.firstName));
-  if (entity?.lastName) parts.push(String(entity.lastName));
-  if (entity?.username) parts.push(`@${entity.username}`);
-  if (parts.length === 0 && entity?.id !== undefined && entity?.id !== null) {
-    parts.push(String(entity.id));
-  }
-  return parts.join(" ").trim() || fallback;
-}
-
-function buildMessageLink(chatEntity: any, messageId: number): string | undefined {
-  if (!messageId) return undefined;
-  if (chatEntity?.username) return `https://t.me/${chatEntity.username}/${messageId}`;
-  if (chatEntity instanceof Api.Channel && chatEntity?.id) {
-    return `https://t.me/c/${chatEntity.id}/${messageId}`;
-  }
-  return undefined;
 }
 
 function parseDateInput(value?: string, endOfDay = false): number | undefined {
@@ -889,12 +212,6 @@ function isAbortError(error: unknown): boolean {
     return /aborted|abort/i.test(error.message);
   }
   return typeof error === "string" && /aborted|abort/i.test(error);
-}
-
-function isBackfillStatusNote(message?: string | null): boolean {
-  if (!message) return false;
-  return message === "Archive 插件重载后自动续跑中"
-    || message === "手动恢复补抓中";
 }
 
 async function ensureSelfInvocation(
@@ -966,188 +283,10 @@ async function resolveUserIdFilter(client: TelegramClient, input?: string): Prom
   return normalizeId(entity?.id);
 }
 
-function describeServiceMessage(message: any): string {
-  const actionName = String(message?.action?.className || "")
-    .replace(/^MessageAction/, "")
-    .trim();
-  return actionName ? `[服务消息:${actionName}]` : "[服务消息]";
-}
-
-function describeDocumentMessage(message: any): string {
-  const attributes = Array.isArray(message?.document?.attributes) ? message.document.attributes : [];
-  if (attributes.some((attr: any) => attr instanceof Api.DocumentAttributeSticker)) return "[贴纸]";
-  if (attributes.some((attr: any) => attr instanceof Api.DocumentAttributeAnimated)) return "[动图]";
-  if (
-    attributes.some((attr: any) => attr instanceof Api.DocumentAttributeAudio && Boolean(attr.voice))
-  ) {
-    return "[语音]";
-  }
-  if (attributes.some((attr: any) => attr instanceof Api.DocumentAttributeAudio)) return "[音频]";
-  if (attributes.some((attr: any) => attr instanceof Api.DocumentAttributeVideo)) return "[视频]";
-  return "[文档]";
-}
-
-function buildMessageText(message: any): { rawText: string; messageType: string; caption?: string } {
-  const rawText = String(message?.message || message?.text || "").trim();
-
-  if (message?.className === "MessageService") {
-    const text = rawText || describeServiceMessage(message);
-    return { rawText: text, messageType: "service" };
-  }
-
-  let placeholder = "";
-  let messageType = "text";
-
-  if (message?.photo) {
-    placeholder = "[图片]";
-    messageType = "photo";
-  } else if (message?.video) {
-    placeholder = "[视频]";
-    messageType = "video";
-  } else if (message?.voice) {
-    placeholder = "[语音]";
-    messageType = "voice";
-  } else if (message?.audio) {
-    placeholder = "[音频]";
-    messageType = "audio";
-  } else if (message?.sticker) {
-    placeholder = "[贴纸]";
-    messageType = "sticker";
-  } else if (message?.document) {
-    placeholder = describeDocumentMessage(message);
-    messageType = "document";
-  } else if (message?.poll) {
-    placeholder = "[投票]";
-    messageType = "poll";
-  } else if (message?.contact) {
-    placeholder = "[联系人]";
-    messageType = "contact";
-  } else if (message?.location || message?.venue) {
-    placeholder = "[位置]";
-    messageType = "location";
-  } else if (message?.media) {
-    placeholder = "[媒体消息]";
-    messageType = "media";
-  }
-
-  if (rawText && placeholder) {
-    return { rawText: `${placeholder} ${rawText}`, messageType, caption: rawText };
-  }
-  if (rawText) return { rawText, messageType };
-  if (placeholder) return { rawText: placeholder, messageType };
-  return { rawText: "[空消息]", messageType: "empty" };
-}
-
-async function resolveChatContext(message: Api.Message): Promise<{
-  chatId?: string;
-  chatType?: ArchiveChatType;
-  chatTitle?: string;
-  chatUsername?: string;
-  chatEntity?: any;
-}> {
-  if (message.isPrivate) return {};
-  if (!message.isGroup && !message.isChannel) return {};
-
-  let chat: any;
-  try {
-    chat = await message.getChat();
-  } catch {
-    chat = undefined;
-  }
-
-  const chatId =
-    normalizeId(message.chatId)
-    || normalizeId(chat?.id)
-    || normalizeId(message.inputChat);
-  if (!chatId) return {};
-
-  let chatType: ArchiveChatType | undefined;
-  if (chat instanceof Api.Channel) {
-    chatType = chat.megagroup ? "supergroup" : "channel";
-  } else if (chat instanceof Api.Chat) {
-    chatType = "group";
-  } else if (message.isChannel) {
-    chatType = "channel";
-  } else if (message.isGroup) {
-    chatType = "group";
-  }
-  if (!chatType) return {};
-
-  return {
-    chatId,
-    chatType,
-    chatTitle: String(chat?.title || chat?.username || chatId),
-    chatUsername: chat?.username ? String(chat.username) : undefined,
-    chatEntity: chat,
-  };
-}
-
-async function resolveSenderContext(message: Api.Message): Promise<{
-  senderId?: string;
-  senderDisplay?: string;
-  senderUsername?: string;
-}> {
-  let sender: any;
-  try {
-    sender = await message.getSender();
-  } catch {
-    sender = undefined;
-  }
-
-  const senderId = normalizeId(message.senderId) || normalizeId(sender?.id);
-
-  const senderDisplay = sender
-    ? buildEntityDisplay(sender, senderId || "unknown")
-    : String((message as any).postAuthor || senderId || "unknown");
-  const senderUsername = sender?.username ? String(sender.username) : undefined;
-
-  return { senderId, senderDisplay, senderUsername };
-}
-
-async function buildArchiveInput(message: Api.Message): Promise<{
-  chatType?: ArchiveChatType;
-  chatTitle?: string;
-  chatUsername?: string;
-  senderUsername?: string;
-  input?: ArchiveMessageInput;
-}> {
-  const chat = await resolveChatContext(message);
-  if (!chat.chatId || !chat.chatType || !chat.chatTitle) return {};
-
-  const sender = await resolveSenderContext(message);
-  const text = buildMessageText(message);
-  const messageId = Number((message as any).id);
-  if (!messageId) return {};
-
-  return {
-    chatType: chat.chatType,
-    chatTitle: chat.chatTitle,
-    chatUsername: chat.chatUsername,
-    senderUsername: sender.senderUsername,
-    input: {
-      chatId: chat.chatId,
-      messageId,
-      senderId: sender.senderId,
-      senderDisplay: sender.senderDisplay,
-      date: getDateNumber((message as any).date),
-      rawText: text.rawText,
-      textNormalized: normalizeText(text.rawText),
-      messageType: text.messageType,
-      caption: text.caption,
-      replyToMsgId:
-        (message as any).replyTo?.replyToMsgId
-        || (message as any).replyToMsgId
-        || undefined,
-      groupedId: normalizeId((message as any).groupedId),
-      link: buildMessageLink(chat.chatEntity, messageId),
-    },
-  };
-}
-
 class ArchivePlugin extends Plugin {
   name = pluginName;
   private backfillPromise: Promise<void> | null = null;
-  private activeJobId: number | null = null;
+  private activeBackfill: ActiveBackfillRuntime | null = null;
   private backfillAbortController: AbortController | null = null;
   private lifecycle: GenerationContext | null = null;
   private ownerIdCache: { current: string | null } = { current: null };
@@ -1166,7 +305,7 @@ class ArchivePlugin extends Plugin {
   cleanup(): void {
     this.lifecycle = null;
     this.backfillPromise = null;
-    this.activeJobId = null;
+    this.activeBackfill = null;
     this.backfillAbortController = null;
     this.ownerIdCache.current = null;
     this.runtimeStats = createRuntimeStats();
@@ -1174,16 +313,18 @@ class ArchivePlugin extends Plugin {
 
   description: string = renderHelpSections(
     "🗂️ <b>Archive 帮助</b>",
-    "持久化归档群组/频道消息，并提供全文检索与历史补抓。",
+    "持久化归档群组/频道消息，并提供全文检索与单会话历史补抓。",
     [
       {
         heading: "📌 基本命令：",
         lines: [
           `<code>${commandName} help</code> - 查看帮助`,
           `<code>${commandName} status</code> - 查看归档状态`,
-          `<code>${commandName} backfill</code> - 启动历史补抓`,
-          `<code>${commandName} backfill resume</code> - 手动恢复最近一次可续跑补抓`,
-          `<code>${commandName} backfill stop</code> - 停止当前补抓并保留断点`,
+          `<code>${commandName} backfill</code> - 查看可补抓会话列表`,
+          `<code>${commandName} backfill list [页码]</code> - 分页展示可补抓会话`,
+          `<code>${commandName} backfill run &lt;chatId或@username&gt;</code> - 补抓单个会话`,
+          `<code>${commandName} backfill resume</code> - 恢复最近失败/停止的会话补抓`,
+          `<code>${commandName} backfill stop</code> - 停止当前会话补抓并保留断点`,
         ],
       },
       {
@@ -1227,7 +368,7 @@ class ArchivePlugin extends Plugin {
         return;
       }
       if (subCommand === "backfill") {
-        await this.handleBackfill(msg);
+        await this.handleBackfill(msg, parts.slice(2));
         return;
       }
       if (subCommand === "bl") {
@@ -1289,6 +430,12 @@ class ArchivePlugin extends Plugin {
           username: archive.chatUsername,
           lastSeenAt: Date.now(),
         });
+        db.upsertBackfillTargetMeta({
+          chatId: archive.input.chatId,
+          chatType: archive.chatType,
+          title: archive.chatTitle,
+          username: archive.chatUsername,
+        });
 
         if (archive.input.senderId) {
           db.upsertUser({
@@ -1312,11 +459,66 @@ class ArchivePlugin extends Plugin {
     }
   };
 
+  private getBackfillDisplayStatus(record?: BackfillTargetRecord): string {
+    if (!record) return "未抓取";
+    if (record.status === "running") return "进行中";
+    if (record.status === "failed") return "失败待恢复";
+    if (record.status === "stopped") return "已停止待恢复";
+    if (record.completedOnce) return "已完成";
+    return "未抓取";
+  }
+
+  private formatBackfillTargetRef(target: { chatId: string; username?: string }): string {
+    return target.username ? `@${target.username}` : target.chatId;
+  }
+
+  private async listAvailableBackfillDialogs(client: TelegramClient, db: ArchiveDB): Promise<BackfillDialogOption[]> {
+    const dialogs: BackfillDialogOption[] = [];
+    for await (const dialog of client.iterDialogs({})) {
+      if (!dialog?.entity) continue;
+      if (!dialog.isGroup && !dialog.isChannel) continue;
+      const entity = dialog.entity as any;
+      const chatId = normalizeId(entity?.id);
+      if (!chatId || db.isChatBlacklisted(chatId)) continue;
+      let chatType: ArchiveChatType = "group";
+      if (entity instanceof Api.Channel) {
+        chatType = entity.megagroup ? "supergroup" : "channel";
+      }
+      const title = String(dialog.title || dialog.name || entity?.title || chatId);
+      const username = entity?.username ? String(entity.username) : undefined;
+      db.upsertBackfillTargetMeta({ chatId, title, username, chatType });
+      dialogs.push({
+        chatId,
+        title,
+        username,
+        chatType,
+        inputEntity: dialog.inputEntity || dialog.entity,
+      });
+    }
+    return dialogs;
+  }
+
+  private async resolveBackfillDialog(
+    client: TelegramClient,
+    rawTarget: string,
+    db: ArchiveDB
+  ): Promise<BackfillDialogOption | undefined> {
+    const normalized = rawTarget.trim().replace(/^@/, "").toLowerCase();
+    const dialogs = await this.listAvailableBackfillDialogs(client, db);
+    return dialogs.find((dialog) =>
+      dialog.chatId === rawTarget
+      || dialog.chatId === normalized
+      || dialog.username?.toLowerCase() === normalized
+      || `@${dialog.username?.toLowerCase() || ""}` === `@${normalized}`
+    );
+  }
+
   private async handleStatus(msg: Api.Message): Promise<void> {
     const db = new ArchiveDB();
     try {
       const stats = db.getStats();
-      const latestJob = db.getLatestBackfillJob();
+      const summary = db.getBackfillTargetSummary();
+      const resumable = db.getLatestResumableBackfillTarget();
       const lines = [
         "🗃️ <b>Archive 状态</b>",
         "",
@@ -1335,6 +537,7 @@ class ArchivePlugin extends Plugin {
         `<b>最近收到:</b> ${this.runtimeStats.lastSeenAt ? formatTime(this.runtimeStats.lastSeenAt) : "暂无"}`,
         `<b>最近入库:</b> ${this.runtimeStats.lastStoredAt ? formatTime(this.runtimeStats.lastStoredAt) : "暂无"}`,
       ];
+
       if (this.runtimeStats.lastSkipReason) {
         lines.push(`<b>最近跳过原因:</b> ${htmlEscape(this.runtimeStats.lastSkipReason)}`);
       }
@@ -1342,25 +545,28 @@ class ArchivePlugin extends Plugin {
         lines.push(`<b>最近监听错误:</b> ${htmlEscape(this.runtimeStats.lastError)}`);
       }
 
-      if (latestJob) {
-        lines.push("");
-        lines.push("🛠️ <b>最近补抓任务</b>");
-        lines.push(`<b>ID:</b> ${latestJob.id}`);
-        lines.push(`<b>状态:</b> ${htmlEscape(latestJob.status)}`);
-        lines.push(`<b>时间窗口:</b> ${htmlEscape(latestJob.windowSpec || "全量")}`);
-        lines.push(`<b>开始:</b> ${formatTime(latestJob.startedAt)}`);
-        if (latestJob.finishedAt) lines.push(`<b>结束:</b> ${formatTime(latestJob.finishedAt)}`);
-        if (latestJob.currentChatTitle) {
-          lines.push(`<b>当前会话:</b> ${htmlEscape(latestJob.currentChatTitle)}`);
-        }
-        lines.push(`<b>已处理会话:</b> ${latestJob.processedChats}`);
-        lines.push(`<b>已处理消息:</b> ${latestJob.processedMessages}`);
-        if (latestJob.lastError) {
-          lines.push(
-            isBackfillStatusNote(latestJob.lastError)
-              ? `<b>提示:</b> ${htmlEscape(latestJob.lastError)}`
-              : `<b>错误:</b> ${htmlEscape(latestJob.lastError)}`
-          );
+      lines.push("");
+      lines.push("🛠️ <b>Backfill 状态</b>");
+      lines.push(`<b>已完成会话:</b> ${summary.completed}`);
+      lines.push(`<b>进行中会话:</b> ${summary.running}`);
+      lines.push(`<b>失败待恢复:</b> ${summary.failed}`);
+      lines.push(`<b>停止待恢复:</b> ${summary.stopped}`);
+
+      if (this.activeBackfill) {
+        lines.push(
+          `<b>当前运行:</b> ${htmlEscape(this.activeBackfill.title)} <code>${htmlEscape(this.activeBackfill.chatId)}</code>`
+        );
+        lines.push(`<b>运行中已处理消息:</b> ${this.activeBackfill.processedMessages}`);
+      } else {
+        lines.push("<b>当前运行:</b> 无");
+      }
+
+      if (resumable) {
+        lines.push(
+          `<b>最近可恢复:</b> ${htmlEscape(resumable.title)} <code>${htmlEscape(resumable.chatId)}</code> · ${htmlEscape(this.getBackfillDisplayStatus(resumable))}`
+        );
+        if (resumable.lastError) {
+          lines.push(`<b>最近错误:</b> ${htmlEscape(resumable.lastError)}`);
         }
       }
 
@@ -1370,10 +576,18 @@ class ArchivePlugin extends Plugin {
     }
   }
 
-  private async handleBackfill(msg: Api.Message): Promise<void> {
-    const parts = String(msg.message || msg.text || "").trim().split(/\s+/).filter(Boolean);
-    const action = parts[2]?.toLowerCase();
+  private async handleBackfill(msg: Api.Message, args: string[]): Promise<void> {
+    const action = args[0]?.toLowerCase();
 
+    if (!action || action === "list") {
+      const pageRaw = action === "list" ? args[1] : args[0];
+      await this.handleBackfillList(msg, pageRaw);
+      return;
+    }
+    if (action === "run") {
+      await this.handleBackfillRun(msg, args[1]);
+      return;
+    }
     if (action === "resume") {
       await this.handleBackfillResume(msg);
       return;
@@ -1383,13 +597,84 @@ class ArchivePlugin extends Plugin {
       return;
     }
 
+    if (/^\d+(d|h|min)$/i.test(action)) {
+      await msg.edit({
+        text: `❌ 已移除全量 backfill 模式\n请先用 <code>${commandName} backfill</code> 查看会话，再执行 <code>${commandName} backfill run &lt;chatId或@username&gt;</code>`,
+        parseMode: "html",
+      });
+      return;
+    }
+
+    await msg.edit({ text: this.description, parseMode: "html", linkPreview: false });
+  }
+
+  private async handleBackfillList(msg: Api.Message, pageRaw?: string): Promise<void> {
     const client = await getGlobalClient();
     if (!client) {
       await msg.edit({ text: "❌ Telegram 客户端未初始化" });
       return;
     }
+
+    const page = Math.max(1, parseInt(pageRaw || "1", 10) || 1);
+    const db = new ArchiveDB();
+    try {
+      const dialogs = await this.listAvailableBackfillDialogs(client, db);
+      const statusMap = db.getBackfillTargetsMap();
+      const totalPages = Math.max(1, Math.ceil(dialogs.length / BACKFILL_LIST_PAGE_SIZE));
+      const safePage = Math.min(page, totalPages);
+      const start = (safePage - 1) * BACKFILL_LIST_PAGE_SIZE;
+      const items = dialogs.slice(start, start + BACKFILL_LIST_PAGE_SIZE);
+
+      const lines = [
+        "🧭 <b>Archive Backfill 列表</b>",
+        `<b>页码:</b> ${safePage}/${totalPages}`,
+        `<b>会话总数:</b> ${dialogs.length}`,
+      ];
+
+      if (this.activeBackfill) {
+        lines.push(
+          `<b>当前运行:</b> ${htmlEscape(this.activeBackfill.title)} <code>${htmlEscape(this.activeBackfill.chatId)}</code>`
+        );
+      }
+
+      lines.push("");
+      if (items.length === 0) {
+        lines.push("暂无可补抓会话");
+      } else {
+        for (const [index, item] of items.entries()) {
+          const status = statusMap.get(item.chatId);
+          const ref = this.formatBackfillTargetRef(item);
+          lines.push(
+            `${start + index + 1}. <b>${htmlEscape(item.title)}</b> · <code>${htmlEscape(ref)}</code> · ${htmlEscape(this.getBackfillDisplayStatus(status))}`
+          );
+        }
+      }
+
+      lines.push("");
+      lines.push(`运行: <code>${commandName} backfill run &lt;chatId或@username&gt;</code>`);
+      if (safePage < totalPages) {
+        lines.push(`下一页: <code>${commandName} backfill list ${safePage + 1}</code>`);
+      }
+      if (safePage > 1) {
+        lines.push(`上一页: <code>${commandName} backfill list ${safePage - 1}</code>`);
+      }
+
+      await msg.edit({ text: lines.join("\n"), parseMode: "html", linkPreview: false });
+    } finally {
+      db.close();
+    }
+  }
+
+  private async handleBackfillRun(msg: Api.Message, rawTarget?: string): Promise<void> {
+    if (!rawTarget) {
+      await msg.edit({
+        text: `用法: <code>${commandName} backfill run &lt;chatId或@username&gt;</code>`,
+        parseMode: "html",
+      });
+      return;
+    }
     if (this.backfillPromise) {
-      await msg.edit({ text: "⚠️ 历史补抓已在运行中" });
+      await msg.edit({ text: "⚠️ 当前已有会话 backfill 正在运行" });
       return;
     }
     if (!this.lifecycle) {
@@ -1397,114 +682,108 @@ class ArchivePlugin extends Plugin {
       return;
     }
 
-    let windowSpec: string | undefined;
-    let cutoffTs: number | undefined;
-    try {
-      ({ windowSpec, cutoffTs } = parseBackfillWindowSpec(parts[2]));
-    } catch (error) {
-      await msg.edit({ text: `❌ ${htmlEscape(extractErrorMessage(error))}`, parseMode: "html" }).catch(() => undefined);
+    const client = await getGlobalClient();
+    if (!client) {
+      await msg.edit({ text: "❌ Telegram 客户端未初始化" });
       return;
     }
 
     const db = new ArchiveDB();
-    const jobId = db.createBackfillJob(windowSpec);
-    this.activeJobId = jobId;
-    db.close();
+    try {
+      const target = await this.resolveBackfillDialog(client, rawTarget, db);
+      if (!target) {
+        await msg.edit({
+          text: `❌ 未找到可补抓会话: <code>${htmlEscape(rawTarget)}</code>\n请先用 <code>${commandName} backfill</code> 查看列表`,
+          parseMode: "html",
+        });
+        return;
+      }
 
-    await msg.edit({
-      text: [
-        `🔄 已启动历史补抓任务 #${jobId}`,
-        `⏱️ 时间窗口: <code>${htmlEscape(windowSpec || "全量")}</code>`,
-        `可用 <code>${commandName} status</code> 查看进度`,
-      ].join("\n"),
-      parseMode: "html",
-    });
+      const existing = db.getBackfillTarget(target.chatId);
+      await msg.edit({
+        text: [
+          `🔄 开始补抓会话 <b>${htmlEscape(target.title)}</b>`,
+          `目标: <code>${htmlEscape(this.formatBackfillTargetRef(target))}</code>`,
+          existing?.completedOnce ? "状态: 已抓取过，本次将重新扫描该会话" : "状态: 首次补抓",
+        ].join("\n"),
+        parseMode: "html",
+      });
 
-    this.startBackfillJob(client, jobId, cutoffTs);
-  }
-
-  private startBackfillJob(
-    client: TelegramClient,
-    jobId: number,
-    cutoffTs?: number,
-    resumeState?: BackfillResumeState
-  ): void {
-    if (!this.lifecycle) {
-      throw new Error("Archive 插件生命周期尚未初始化");
+      this.startBackfillTarget(client, target, {
+        resume: false,
+        processedMessages: 0,
+      });
+    } finally {
+      db.close();
     }
-
-    this.activeJobId = jobId;
-    this.backfillAbortController = new AbortController();
-    this.backfillPromise = this.lifecycle.runTask(
-      async (lifecycleSignal) => {
-        const signal = AbortSignal.any([lifecycleSignal, this.backfillAbortController!.signal]);
-        await this.runBackfill(client, jobId, signal, cutoffTs, resumeState);
-      },
-      { label: `archive:backfill:${jobId}`, kind: "promise" }
-    ).finally(() => {
-      this.backfillPromise = null;
-      this.activeJobId = null;
-      this.backfillAbortController = null;
-    });
   }
 
   private async handleBackfillResume(msg: Api.Message): Promise<void> {
     if (this.backfillPromise) {
-      await msg.edit({ text: "⚠️ 历史补抓已在运行中" });
+      await msg.edit({ text: "⚠️ 当前已有会话 backfill 正在运行" });
       return;
     }
-    if (!this.lifecycle) {
-      await msg.edit({ text: "❌ Archive 插件生命周期尚未初始化" });
+
+    const client = await getGlobalClient();
+    if (!client) {
+      await msg.edit({ text: "❌ Telegram 客户端未初始化" });
       return;
     }
 
     const db = new ArchiveDB();
-    let job: BackfillJobRecord | undefined;
     try {
-      job = db.getLatestBackfillJob();
-      if (!job || !["aborted", "stopped", "failed"].includes(job.status)) {
-        await msg.edit({ text: "ℹ️ 没有可恢复的补抓任务" });
+      const targetState = db.getLatestResumableBackfillTarget();
+      if (!targetState || !["failed", "stopped", "running"].includes(targetState.status)) {
+        await msg.edit({ text: "ℹ️ 没有可恢复的会话补抓任务" });
         return;
       }
+      const target = await this.resolveBackfillDialog(client, targetState.chatId, db);
+      if (!target) {
+        await msg.edit({
+          text: `❌ 无法恢复 <code>${htmlEscape(targetState.chatId)}</code>\n该会话当前不可见或已被黑名单排除`,
+          parseMode: "html",
+        });
+        return;
+      }
+
+      await msg.edit({
+        text: [
+          `▶️ 恢复会话补抓 <b>${htmlEscape(target.title)}</b>`,
+          `目标: <code>${htmlEscape(this.formatBackfillTargetRef(target))}</code>`,
+          `断点消息: <code>${targetState.cursorMessageId || 0}</code>`,
+        ].join("\n"),
+        parseMode: "html",
+      });
+
+      this.startBackfillTarget(client, target, {
+        resume: true,
+        cursorMessageId: targetState.cursorMessageId,
+        processedMessages: targetState.processedMessages,
+      });
     } finally {
       db.close();
     }
-
-    const resumed = await this.resumeBackfillJob(job, false);
-    if (!resumed) {
-      await msg.edit({ text: "❌ 恢复补抓任务失败，请查看日志" });
-      return;
-    }
-
-    await msg.edit({
-      text: [
-        `▶️ 已恢复历史补抓任务 #${job.id}`,
-        `⏱️ 时间窗口: <code>${htmlEscape(job.windowSpec || "全量")}</code>`,
-        `📍 断点: <code>${htmlEscape(job.currentChatTitle || job.currentChatId || "起点")}</code> / 消息 <code>${job.cursorMessageId || 0}</code>`,
-      ].join("\n"),
-      parseMode: "html",
-    });
   }
 
   private async handleBackfillStop(msg: Api.Message): Promise<void> {
-    if (!this.backfillPromise || !this.backfillAbortController || this.activeJobId == null) {
-      await msg.edit({ text: "ℹ️ 当前没有正在运行的补抓任务" });
+    if (!this.backfillPromise || !this.backfillAbortController || !this.activeBackfill) {
+      await msg.edit({ text: "ℹ️ 当前没有正在运行的会话补抓任务" });
       return;
     }
 
-    const activeJobId = this.activeJobId;
+    const active = this.activeBackfill;
     this.backfillAbortController.abort(MANUAL_BACKFILL_STOP_REASON);
 
     try {
       await this.backfillPromise;
     } catch {
-      // runBackfill handles abort as a normal state transition.
+      // runSingleChatBackfill handles abort as a state transition.
     }
 
     await msg.edit({
       text: [
-        `⏹️ 已停止历史补抓任务 #${activeJobId}`,
-        `可用 <code>${commandName} backfill resume</code> 从断点继续`,
+        `⏹️ 已停止会话补抓 <b>${htmlEscape(active.title)}</b>`,
+        `可用 <code>${commandName} backfill resume</code> 继续该会话`,
       ].join("\n"),
       parseMode: "html",
     });
@@ -1513,56 +792,196 @@ class ArchivePlugin extends Plugin {
   private async resumeBackfillIfNeeded(): Promise<void> {
     if (this.backfillPromise || !this.lifecycle) return;
 
+    const client = await getGlobalClient().catch(() => null);
+    if (!client) return;
+
     const db = new ArchiveDB();
-    let job: BackfillJobRecord | undefined;
     try {
-      job = db.getLatestResumableBackfillJob();
+      const targetState = db.getAutoResumableBackfillTarget();
+      if (!targetState) return;
+      const target = await this.resolveBackfillDialog(client, targetState.chatId, db);
+      if (!target) {
+        db.updateBackfillTarget(targetState.chatId, {
+          status: "failed",
+          lastBackfillFinishedAt: Date.now(),
+          lastError: "自动续跑失败：会话当前不可见或已被黑名单排除",
+        });
+        return;
+      }
+      this.startBackfillTarget(client, target, {
+        resume: true,
+        cursorMessageId: targetState.cursorMessageId,
+        processedMessages: targetState.processedMessages,
+        automatic: true,
+      });
     } finally {
       db.close();
     }
-    if (!job) return;
-    await this.resumeBackfillJob(job, true);
   }
 
-  private async resumeBackfillJob(job: BackfillJobRecord, automatic: boolean): Promise<boolean> {
-    let cutoffTs: number | undefined;
-    try {
-      ({ cutoffTs } = parseBackfillWindowSpec(job.windowSpec));
-    } catch (error) {
-      console.error("[archive] Failed to parse resumable backfill window spec:", error);
-      return false;
+  private startBackfillTarget(
+    client: TelegramClient,
+    target: BackfillDialogOption,
+    options: {
+      resume: boolean;
+      cursorMessageId?: number;
+      processedMessages: number;
+      automatic?: boolean;
+    }
+  ): void {
+    if (!this.lifecycle) {
+      throw new Error("Archive 插件生命周期尚未初始化");
     }
 
-    let client: TelegramClient;
-    try {
-      client = await getGlobalClient();
-    } catch (error) {
-      console.error("[archive] Failed to acquire client for backfill resume:", error);
-      return false;
-    }
-
-    const resumeDb = new ArchiveDB();
-    try {
-      resumeDb.updateBackfillJob(job.id, {
-        status: "running",
-        finishedAt: null,
-        lastError: automatic ? "Archive 插件重载后自动续跑中" : "手动恢复补抓中",
-      });
-    } finally {
-      resumeDb.close();
-    }
-
-    console.log(
-      `[archive] resuming backfill job #${job.id} from chat=${job.currentChatId || "start"} cursor=${job.cursorMessageId || 0} processedChats=${job.processedChats} processedMessages=${job.processedMessages}`
-    );
-
-    this.startBackfillJob(client, job.id, cutoffTs, {
-      currentChatId: job.currentChatId,
-      cursorMessageId: job.cursorMessageId,
-      processedChats: job.processedChats,
-      processedMessages: job.processedMessages,
+    this.activeBackfill = {
+      chatId: target.chatId,
+      title: target.title,
+      processedMessages: options.processedMessages,
+      cursorMessageId: options.cursorMessageId,
+    };
+    this.backfillAbortController = new AbortController();
+    this.backfillPromise = this.lifecycle.runTask(
+      async (lifecycleSignal) => {
+        const signal = AbortSignal.any([lifecycleSignal, this.backfillAbortController!.signal]);
+        await this.runSingleChatBackfill(client, target, signal, options);
+      },
+      { label: `archive:backfill:${target.chatId}`, kind: "promise" }
+    ).finally(() => {
+      this.backfillPromise = null;
+      this.activeBackfill = null;
+      this.backfillAbortController = null;
     });
-    return true;
+  }
+
+  private async runSingleChatBackfill(
+    client: TelegramClient,
+    target: BackfillDialogOption,
+    signal: AbortSignal,
+    options: {
+      resume: boolean;
+      cursorMessageId?: number;
+      processedMessages: number;
+      automatic?: boolean;
+    }
+  ): Promise<void> {
+    const db = new ArchiveDB();
+    let processedMessages = options.processedMessages;
+    let cursorMessageId = options.resume ? options.cursorMessageId : undefined;
+    let lastMessageId = cursorMessageId || 0;
+
+    try {
+      db.upsertChat({
+        chatId: target.chatId,
+        chatType: target.chatType,
+        title: target.title,
+        username: target.username,
+        lastSeenAt: Date.now(),
+      });
+      db.upsertBackfillTargetMeta({
+        chatId: target.chatId,
+        title: target.title,
+        username: target.username,
+        chatType: target.chatType,
+      });
+      db.updateBackfillTarget(target.chatId, {
+        status: "running",
+        processedMessages,
+        cursorMessageId,
+        lastBackfillStartedAt: Date.now(),
+        lastBackfillFinishedAt: null,
+        lastError: options.automatic ? "Archive 插件重载后自动续跑中" : null,
+      });
+
+      const iterOptions: { reverse: true; minId?: number } = { reverse: true };
+      if (cursorMessageId) {
+        iterOptions.minId = cursorMessageId;
+      }
+
+      while (true) {
+        try {
+          for await (const message of client.iterMessages(target.inputEntity, iterOptions)) {
+            throwIfAborted(signal);
+            const archive = await buildArchiveInput(message as Api.Message);
+            if (!archive.input) continue;
+            if (archive.input.senderId) {
+              db.upsertUser({
+                userId: archive.input.senderId,
+                username: archive.senderUsername,
+                displayName: archive.input.senderDisplay || archive.input.senderId,
+                lastSeenAt: Date.now(),
+              });
+            }
+            db.insertOrUpdateMessage(archive.input, "backfill");
+            processedMessages += 1;
+            lastMessageId = archive.input.messageId;
+            cursorMessageId = archive.input.messageId;
+            if (this.activeBackfill?.chatId === target.chatId) {
+              this.activeBackfill.processedMessages = processedMessages;
+              this.activeBackfill.cursorMessageId = cursorMessageId;
+            }
+
+            if (processedMessages % BACKFILL_BATCH_SIZE === 0) {
+              db.updateBackfillTarget(target.chatId, {
+                status: "running",
+                processedMessages,
+                cursorMessageId,
+                lastError: null,
+              });
+              await this.requireLifecycle().delay(BACKFILL_BATCH_PAUSE_MS, {
+                label: `archive:backfill-batch-pause:${target.chatId}`,
+              });
+            }
+          }
+          break;
+        } catch (error) {
+          const floodWaitMs = getFloodWaitMs(error);
+          if (floodWaitMs === null) {
+            throw error;
+          }
+          db.updateBackfillTarget(target.chatId, {
+            status: "running",
+            processedMessages,
+            cursorMessageId: lastMessageId || undefined,
+            lastError: `FloodWait ${Math.ceil(floodWaitMs / 1000)}s，等待后继续`,
+          });
+          if (lastMessageId > 0) {
+            iterOptions.minId = lastMessageId;
+          }
+          await this.requireLifecycle().delay(floodWaitMs, {
+            label: `archive:backfill-floodwait:${target.chatId}`,
+          });
+        }
+      }
+
+      db.updateBackfillTarget(target.chatId, {
+        status: "completed",
+        completedOnce: true,
+        processedMessages,
+        cursorMessageId,
+        lastBackfillFinishedAt: Date.now(),
+        lastError: null,
+      });
+    } catch (error) {
+      if (isAbortError(error) || signal.aborted) {
+        this.markBackfillAborted(db, {
+          chatId: target.chatId,
+          title: target.title,
+          cursorMessageId,
+          processedMessages,
+        }, signal.reason);
+        return;
+      }
+      db.updateBackfillTarget(target.chatId, {
+        status: "failed",
+        processedMessages,
+        cursorMessageId,
+        lastBackfillFinishedAt: Date.now(),
+        lastError: extractErrorMessage(error),
+      });
+      throw error;
+    } finally {
+      db.close();
+    }
   }
 
   private async handleBlacklist(msg: Api.Message, args: string[]): Promise<void> {
@@ -1617,201 +1036,6 @@ class ArchivePlugin extends Plugin {
         parseMode: "html",
         linkPreview: false,
       });
-    } finally {
-      db.close();
-    }
-  }
-
-  private async runBackfill(
-    client: TelegramClient,
-    jobId: number,
-    signal: AbortSignal,
-    cutoffTs?: number,
-    resumeState?: BackfillResumeState
-  ): Promise<void> {
-    const db = new ArchiveDB();
-    let processedChats = resumeState?.processedChats ?? 0;
-    let processedMessages = resumeState?.processedMessages ?? 0;
-    let currentChatId: string | undefined;
-    let currentChatTitle: string | undefined;
-    let cursorMessageId: number | undefined;
-    let remainingCompletedChatsToSkip = Math.max(0, resumeState?.processedChats ?? 0);
-    let pendingResumeChatId = resumeState?.currentChatId;
-    let pendingResumeCursorMessageId = resumeState?.cursorMessageId;
-    let resumeCursorApplied = pendingResumeCursorMessageId == null;
-
-    try {
-      for await (const dialog of client.iterDialogs({})) {
-        throwIfAborted(signal);
-        if (!dialog?.entity) continue;
-        if (!dialog.isGroup && !dialog.isChannel) continue;
-
-        const entity = dialog.entity as any;
-        const chatId = normalizeId(entity?.id);
-        if (!chatId) continue;
-
-        if (remainingCompletedChatsToSkip > 0) {
-          remainingCompletedChatsToSkip -= 1;
-          continue;
-        }
-
-        currentChatId = chatId;
-
-        let chatType: ArchiveChatType = "group";
-        if (entity instanceof Api.Channel) {
-          chatType = entity.megagroup ? "supergroup" : "channel";
-        }
-
-        const title = String(dialog.title || dialog.name || entity?.title || chatId);
-        currentChatTitle = title;
-
-        if (db.isChatBlacklisted(chatId)) {
-          processedChats += 1;
-          db.updateBackfillJob(jobId, {
-            status: "running",
-            currentChatId: chatId,
-            currentChatTitle: title,
-            processedChats,
-            processedMessages,
-            lastError: `跳过黑名单会话: ${title}`,
-          });
-          continue;
-        }
-
-        db.upsertChat({
-          chatId,
-          chatType,
-          title,
-          username: entity?.username ? String(entity.username) : undefined,
-          lastSeenAt: Date.now(),
-        });
-
-        db.updateBackfillJob(jobId, {
-          status: "running",
-          currentChatId: chatId,
-          currentChatTitle: title,
-          cursorMessageId: pendingResumeCursorMessageId,
-          processedChats,
-          processedMessages,
-        });
-
-        let lastMessageId = 0;
-        const iterMessagesOptions: { reverse: true; minId?: number } = { reverse: true };
-        if (!resumeCursorApplied && pendingResumeCursorMessageId != null) {
-          if (!pendingResumeChatId || pendingResumeChatId === chatId) {
-            iterMessagesOptions.minId = pendingResumeCursorMessageId;
-            console.log(
-              `[archive] applying backfill resume cursor for job #${jobId}: chat=${chatId} minId=${pendingResumeCursorMessageId}`
-            );
-          } else {
-            console.warn(
-              `[archive] resume chat mismatch for job #${jobId}: expected ${pendingResumeChatId}, got ${chatId}; replaying chat from the beginning`
-            );
-          }
-          resumeCursorApplied = true;
-          pendingResumeCursorMessageId = undefined;
-          pendingResumeChatId = undefined;
-        }
-
-        while (true) {
-          try {
-            for await (const message of client.iterMessages(dialog.inputEntity || dialog.entity, iterMessagesOptions)) {
-              throwIfAborted(signal);
-              const messageTs = getDateNumber(message.date);
-              if (cutoffTs && messageTs < cutoffTs) {
-                break;
-              }
-              const archive = await buildArchiveInput(message as Api.Message);
-              if (!archive.input) continue;
-              if (archive.input.senderId) {
-                db.upsertUser({
-                  userId: archive.input.senderId,
-                  username: archive.senderUsername,
-                  displayName: archive.input.senderDisplay || archive.input.senderId,
-                  lastSeenAt: Date.now(),
-                });
-              }
-              db.insertOrUpdateMessage(archive.input, "backfill");
-              processedMessages += 1;
-              lastMessageId = archive.input.messageId;
-              cursorMessageId = archive.input.messageId;
-
-              if (processedMessages % BACKFILL_BATCH_SIZE === 0) {
-                db.updateBackfillJob(jobId, {
-                  status: "running",
-                  currentChatId: chatId,
-                  currentChatTitle: title,
-                  cursorMessageId: lastMessageId,
-                  processedChats,
-                  processedMessages,
-                });
-                await this.requireLifecycle().delay(BACKFILL_BATCH_PAUSE_MS, {
-                  label: `archive:backfill-batch-pause:${jobId}`,
-                });
-              }
-            }
-            break;
-          } catch (error) {
-            const floodWaitMs = getFloodWaitMs(error);
-            if (floodWaitMs === null) {
-              throw error;
-            }
-            db.updateBackfillJob(jobId, {
-              status: "running",
-              currentChatId: chatId,
-              currentChatTitle: title,
-              cursorMessageId: lastMessageId || undefined,
-              processedChats,
-              processedMessages,
-              lastError: `FloodWait ${Math.ceil(floodWaitMs / 1000)}s，等待后继续`,
-            });
-            await this.requireLifecycle().delay(floodWaitMs, {
-              label: `archive:backfill-floodwait:${jobId}`,
-            });
-          }
-        }
-
-        processedChats += 1;
-        db.updateBackfillJob(jobId, {
-          status: "running",
-          currentChatId: chatId,
-          currentChatTitle: title,
-          cursorMessageId: lastMessageId || undefined,
-          processedChats,
-          processedMessages,
-        });
-        await this.requireLifecycle().delay(BACKFILL_DIALOG_PAUSE_MS, {
-          label: `archive:backfill-dialog-pause:${jobId}`,
-        });
-      }
-
-      db.updateBackfillJob(jobId, {
-        status: "completed",
-        finishedAt: Date.now(),
-        processedChats,
-        processedMessages,
-        lastError: null,
-      });
-    } catch (error) {
-      if (isAbortError(error) || signal.aborted) {
-        this.markBackfillAborted(db, {
-          jobId,
-          processedChats,
-          processedMessages,
-          currentChatId,
-          currentChatTitle,
-          cursorMessageId,
-        }, signal.reason);
-        return;
-      }
-      db.updateBackfillJob(jobId, {
-        status: "failed",
-        finishedAt: Date.now(),
-        processedChats,
-        processedMessages,
-        lastError: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
     } finally {
       db.close();
     }
@@ -1969,14 +1193,12 @@ class ArchivePlugin extends Plugin {
     reason?: unknown
   ): void {
     const isManualStop = reason === MANUAL_BACKFILL_STOP_REASON;
-    db.updateBackfillJob(context.jobId, {
-      status: isManualStop ? "stopped" : "aborted",
-      finishedAt: Date.now(),
-      currentChatId: context.currentChatId,
-      currentChatTitle: context.currentChatTitle,
+    db.updateBackfillTarget(context.chatId, {
+      status: isManualStop ? "stopped" : "failed",
+      title: context.title,
       cursorMessageId: context.cursorMessageId,
-      processedChats: context.processedChats,
       processedMessages: context.processedMessages,
+      lastBackfillFinishedAt: Date.now(),
       lastError: extractErrorMessage(
         reason || (isManualStop ? MANUAL_BACKFILL_STOP_REASON : "Runtime reload aborted archive backfill")
       ),
