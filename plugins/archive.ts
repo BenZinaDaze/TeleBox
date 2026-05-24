@@ -3,6 +3,7 @@ import { getPrefixes } from "@utils/pluginManager";
 import { getGlobalClient } from "@utils/globalClient";
 import { safeGetMe } from "@utils/authGuards";
 import {
+  type ArchiveNormalizationStats,
   ArchiveDB,
   type ArchiveSearchParams,
   type ArchiveSearchRow,
@@ -12,14 +13,16 @@ import {
 } from "@utils/archiveDb";
 import {
   buildArchiveInput,
+  collectChatIdCandidates,
   getDateNumber,
   normalizeId,
   resolveChatContext,
+  toCanonicalChatId,
   type ArchiveChatType,
   type ArchiveMessageInput,
 } from "@utils/archiveMessageBuilder";
 import type { GenerationContext } from "@utils/generationContext";
-import { Api, TelegramClient } from "teleproto";
+import { Api, TelegramClient, utils } from "teleproto";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0] || ".";
@@ -223,11 +226,10 @@ async function ensureSelfInvocation(
 
   if (!ownerIdCacheRef.current) {
     const me = await safeGetMe(msg.client);
-    ownerIdCacheRef.current = normalizeId(me?.id) || "";
+    ownerIdCacheRef.current = me ? getMarkedPeerId(me) || String(me.id) : "";
   }
 
-  const senderId = normalizeId((msg as Api.Message & { senderId?: unknown }).senderId)
-    || normalizeId((msg as Api.Message & { fromId?: unknown }).fromId);
+  const senderId = msg.senderId ? String(msg.senderId) : undefined;
   return Boolean(ownerIdCacheRef.current) && Boolean(senderId) && ownerIdCacheRef.current === senderId;
 }
 
@@ -255,6 +257,25 @@ function extractErrorMessage(error: unknown): string {
   return "未知错误";
 }
 
+function getMarkedPeerId(peer: unknown): string | undefined {
+  if (!peer) return undefined;
+  try {
+    return utils.getPeerId(peer as never);
+  } catch {
+    return undefined;
+  }
+}
+
+function getChatTypeFromEntity(entity: unknown): ArchiveChatType | undefined {
+  if (entity instanceof Api.Channel) {
+    return entity.megagroup ? "supergroup" : "channel";
+  }
+  if (entity instanceof Api.Chat) {
+    return "group";
+  }
+  return undefined;
+}
+
 async function resolveChatIdFilter(client: TelegramClient, input?: string): Promise<string | undefined> {
   if (!input) return undefined;
   if (/^-?\d+$/.test(input)) return input;
@@ -266,7 +287,7 @@ async function resolveChatIdFilter(client: TelegramClient, input?: string): Prom
       `无法解析聊天目标: ${input}\n请使用 @username 或数字 chatId\n原因: ${extractErrorMessage(error)}`
     );
   }
-  return normalizeId(entity?.id);
+  return getMarkedPeerId(entity);
 }
 
 async function resolveUserIdFilter(client: TelegramClient, input?: string): Promise<string | undefined> {
@@ -280,7 +301,7 @@ async function resolveUserIdFilter(client: TelegramClient, input?: string): Prom
       `无法解析用户目标: ${input}\n请使用 @username 或数字 userId\n原因: ${extractErrorMessage(error)}`
     );
   }
-  return normalizeId(entity?.id);
+  return getMarkedPeerId(entity);
 }
 
 class ArchivePlugin extends Plugin {
@@ -313,13 +334,14 @@ class ArchivePlugin extends Plugin {
 
   description: string = renderHelpSections(
     "🗂️ <b>Archive 帮助</b>",
-    "持久化归档群组/频道消息，并提供全文检索与单会话历史补抓。",
+    "持久化归档群组消息，并提供全文检索与单会话历史补抓。",
     [
       {
         heading: "📌 基本命令：",
         lines: [
           `<code>${commandName} help</code> - 查看帮助`,
           `<code>${commandName} status</code> - 查看归档状态`,
+          `<code>${commandName} normalize</code> - 归一化历史 chatId 并合并旧结构残留`,
           `<code>${commandName} backfill</code> - 查看可补抓会话列表`,
           `<code>${commandName} backfill list [页码]</code> - 分页展示可补抓会话`,
           `<code>${commandName} backfill run &lt;chatId或@username&gt;</code> - 补抓单个会话`,
@@ -367,6 +389,10 @@ class ArchivePlugin extends Plugin {
         await this.handleStatus(msg);
         return;
       }
+      if (subCommand === "normalize") {
+        await this.handleNormalize(msg);
+        return;
+      }
       if (subCommand === "backfill") {
         await this.handleBackfill(msg, parts.slice(2));
         return;
@@ -406,10 +432,10 @@ class ArchivePlugin extends Plugin {
       const archive = await buildArchiveInput(msg);
       if (!archive.input || !archive.chatType || !archive.chatTitle) {
         this.runtimeStats.skippedEvents += 1;
-        this.runtimeStats.lastSkipReason = "未解析出群组/频道上下文";
+        this.runtimeStats.lastSkipReason = "未解析出群组上下文";
         return;
       }
-      if (!["group", "supergroup", "channel"].includes(archive.chatType)) {
+      if (!["group", "supergroup"].includes(archive.chatType)) {
         this.runtimeStats.skippedEvents += 1;
         this.runtimeStats.lastSkipReason = `不在采集范围: ${archive.chatType}`;
         return;
@@ -417,7 +443,7 @@ class ArchivePlugin extends Plugin {
 
       const db = new ArchiveDB();
       try {
-        if (db.isChatBlacklisted(archive.input.chatId)) {
+        if (db.isChatBlacklisted(collectChatIdCandidates(archive.chatType, archive.input.chatId))) {
           this.runtimeStats.skippedEvents += 1;
           this.runtimeStats.lastSkipReason = `黑名单会话: ${archive.chatTitle}`;
           return;
@@ -436,15 +462,6 @@ class ArchivePlugin extends Plugin {
           title: archive.chatTitle,
           username: archive.chatUsername,
         });
-
-        if (archive.input.senderId) {
-          db.upsertUser({
-            userId: archive.input.senderId,
-            username: archive.senderUsername,
-            displayName: archive.input.senderDisplay || archive.input.senderId,
-            lastSeenAt: Date.now(),
-          });
-        }
 
         db.insertOrUpdateMessage(archive.input, options?.isEdited ? "edit" : "new");
         this.runtimeStats.storedEvents += 1;
@@ -472,20 +489,45 @@ class ArchivePlugin extends Plugin {
     return target.username ? `@${target.username}` : target.chatId;
   }
 
+  private async buildNormalizationAliasMap(client: TelegramClient): Promise<Map<string, string>> {
+    const aliasMap = new Map<string, string>();
+    for await (const dialog of client.iterDialogs({})) {
+      if (!dialog?.entity) continue;
+      if (!dialog.isGroup && !dialog.isChannel) continue;
+      const entity = dialog.entity as Api.Channel | Api.Chat;
+      const chatType = getChatTypeFromEntity(entity) || (dialog.isChannel ? "channel" : "group");
+      if (chatType === "channel") continue;
+      const canonicalChatId = getMarkedPeerId(dialog.inputEntity)
+        || getMarkedPeerId(entity)
+        || toCanonicalChatId(chatType, dialog.id, entity.id);
+      if (!canonicalChatId) continue;
+      for (const candidate of collectChatIdCandidates(chatType, canonicalChatId, dialog.id, entity.id)) {
+        aliasMap.set(candidate, canonicalChatId);
+      }
+    }
+    return aliasMap;
+  }
+
   private async listAvailableBackfillDialogs(client: TelegramClient, db: ArchiveDB): Promise<BackfillDialogOption[]> {
     const dialogs: BackfillDialogOption[] = [];
     for await (const dialog of client.iterDialogs({})) {
       if (!dialog?.entity) continue;
       if (!dialog.isGroup && !dialog.isChannel) continue;
-      const entity = dialog.entity as any;
-      const chatId = normalizeId(entity?.id);
-      if (!chatId || db.isChatBlacklisted(chatId)) continue;
+      const entity = dialog.entity as Api.Channel | Api.Chat;
       let chatType: ArchiveChatType = "group";
       if (entity instanceof Api.Channel) {
         chatType = entity.megagroup ? "supergroup" : "channel";
       }
-      const title = String(dialog.title || dialog.name || entity?.title || chatId);
-      const username = entity?.username ? String(entity.username) : undefined;
+      if (chatType === "channel") continue;
+      const chatId = getMarkedPeerId(dialog.inputEntity)
+        || getMarkedPeerId(entity)
+        || toCanonicalChatId(chatType, dialog.id, entity.id);
+      const chatIdCandidates = collectChatIdCandidates(chatType, chatId, dialog.id, entity.id);
+      if (!chatId || db.isChatBlacklisted(chatIdCandidates)) continue;
+      const title = String(dialog.title || dialog.name || entity.title || chatId);
+      const username = entity instanceof Api.Channel && entity.username
+        ? String(entity.username)
+        : undefined;
       db.upsertBackfillTargetMeta({ chatId, title, username, chatType });
       dialogs.push({
         chatId,
@@ -508,6 +550,8 @@ class ArchivePlugin extends Plugin {
     return dialogs.find((dialog) =>
       dialog.chatId === rawTarget
       || dialog.chatId === normalized
+      || collectChatIdCandidates(dialog.chatType, dialog.chatId).includes(rawTarget.trim())
+      || collectChatIdCandidates(dialog.chatType, dialog.chatId).includes(normalized)
       || dialog.username?.toLowerCase() === normalized
       || `@${dialog.username?.toLowerCase() || ""}` === `@${normalized}`
     );
@@ -523,7 +567,6 @@ class ArchivePlugin extends Plugin {
         "🗃️ <b>Archive 状态</b>",
         "",
         `<b>聊天数:</b> ${stats.chats}`,
-        `<b>用户数:</b> ${stats.users}`,
         `<b>消息数:</b> ${stats.messages}`,
         `<b>版本数:</b> ${stats.versions}`,
         `<b>已删除标记:</b> ${stats.deletedMessages}`,
@@ -571,6 +614,54 @@ class ArchivePlugin extends Plugin {
       }
 
       await msg.edit({ text: lines.join("\n"), parseMode: "html", linkPreview: false });
+    } finally {
+      db.close();
+    }
+  }
+
+  private formatNormalizationStats(stats: ArchiveNormalizationStats): string {
+    return [
+      "✅ <b>Archive chatId 归一化完成</b>",
+      "",
+      `<b>别名映射:</b> ${stats.aliasMappings}`,
+      `<b>聊天记录:</b> ${stats.chatsRewritten}`,
+      `<b>黑名单:</b> ${stats.blacklistRewritten}`,
+      `<b>Backfill 目标:</b> ${stats.backfillTargetsRewritten}`,
+      `<b>Backfill Job 更新:</b> ${stats.backfillJobsUpdated}`,
+      `<b>删除频道会话:</b> ${stats.droppedChannelChats}`,
+      `<b>删除频道消息:</b> ${stats.droppedChannelMessages}`,
+      `<b>删除频道版本:</b> ${stats.droppedChannelVersions}`,
+      `<b>消息行:</b> ${stats.messageRowsRewritten}`,
+      `<b>合并消息组:</b> ${stats.mergedMessageGroups}`,
+      `<b>版本行:</b> ${stats.versionRowsRewritten}`,
+    ].join("\n");
+  }
+
+  private async handleNormalize(msg: Api.Message): Promise<void> {
+    if (this.backfillPromise || this.activeBackfill) {
+      await msg.edit({ text: "❌ 当前有 backfill 正在运行，请先停止后再执行 normalize" });
+      return;
+    }
+
+    await msg.edit({ text: "⏳ 正在归一化 Archive chatId，请稍候..." }).catch(() => undefined);
+
+    const client = await getGlobalClient();
+    const aliasMap = await this.buildNormalizationAliasMap(client);
+    const db = new ArchiveDB();
+    try {
+      const stats = db.normalizeChatIds(aliasMap);
+      await msg.edit({
+        text: this.formatNormalizationStats(stats),
+        parseMode: "html",
+        linkPreview: false,
+      });
+    } catch (error) {
+      await msg.edit({
+        text: `❌ Archive 归一化失败\n${htmlEscape(extractErrorMessage(error))}`,
+        parseMode: "html",
+        linkPreview: false,
+      }).catch(() => undefined);
+      throw error;
     } finally {
       db.close();
     }
@@ -903,14 +994,6 @@ class ArchivePlugin extends Plugin {
             throwIfAborted(signal);
             const archive = await buildArchiveInput(message as Api.Message);
             if (!archive.input) continue;
-            if (archive.input.senderId) {
-              db.upsertUser({
-                userId: archive.input.senderId,
-                username: archive.senderUsername,
-                displayName: archive.input.senderDisplay || archive.input.senderId,
-                lastSeenAt: Date.now(),
-              });
-            }
             db.insertOrUpdateMessage(archive.input, "backfill");
             processedMessages += 1;
             lastMessageId = archive.input.messageId;
@@ -1015,7 +1098,9 @@ class ArchivePlugin extends Plugin {
       }
 
       if (action === "rm" || action === "remove" || action === "del") {
-        const removed = db.removeChatBlacklist(chat.chatId);
+        const removed = db.removeChatBlacklist(
+          collectChatIdCandidates(chat.chatType, chat.chatId, chat.chatEntity?.id)
+        );
         await msg.edit({
           text: removed
             ? `✅ 已将 <b>${htmlEscape(chat.chatTitle)}</b> 移出 Archive 黑名单`
@@ -1030,6 +1115,7 @@ class ArchivePlugin extends Plugin {
         chatId: chat.chatId,
         title: chat.chatTitle,
         username: chat.chatUsername,
+        matchChatIds: collectChatIdCandidates(chat.chatType, chat.chatId, chat.chatEntity?.id),
       });
       await msg.edit({
         text: `✅ 已将 <b>${htmlEscape(chat.chatTitle)}</b> 加入 Archive 黑名单\n后续将不再采集，搜索结果也会忽略该会话历史消息。`,
@@ -1141,8 +1227,8 @@ class ArchivePlugin extends Plugin {
       const lines = rows.map((row, index) => {
         const summary = compact(row.rawText || row.caption || `[${row.messageType}]`);
         const prefix = `${index + 1}. <code>${htmlEscape(formatTime(row.date))}</code> <b>${htmlEscape(
-          row.chatTitle || row.chatId
-        )}</b> · ${htmlEscape(row.senderDisplay || row.senderId || "unknown")}`;
+          row.chatId
+        )}</b> · ${htmlEscape(row.senderId || "unknown")}`;
         if (row.link) {
           return `${prefix}\n<a href="${htmlEscape(row.link)}">${htmlEscape(summary)}</a>`;
         }

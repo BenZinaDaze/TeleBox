@@ -1,4 +1,4 @@
-import { Api } from "teleproto";
+import { Api, utils } from "teleproto";
 
 export type ArchiveChatType = "group" | "supergroup" | "channel";
 
@@ -6,8 +6,8 @@ export interface ArchiveMessageInput {
   chatId: string;
   messageId: number;
   senderId?: string;
-  senderDisplay?: string;
   date: number;
+  editDate: number;
   rawText: string;
   textNormalized: string;
   messageType: string;
@@ -15,18 +15,6 @@ export interface ArchiveMessageInput {
   replyToMsgId?: number;
   groupedId?: string;
   link?: string;
-}
-
-function buildEntityDisplay(entity: any, fallback: string): string {
-  const parts: string[] = [];
-  if (entity?.title) parts.push(String(entity.title));
-  if (entity?.firstName) parts.push(String(entity.firstName));
-  if (entity?.lastName) parts.push(String(entity.lastName));
-  if (entity?.username) parts.push(`@${entity.username}`);
-  if (parts.length === 0 && entity?.id !== undefined && entity?.id !== null) {
-    parts.push(String(entity.id));
-  }
-  return parts.join(" ").trim() || fallback;
 }
 
 function buildMessageLink(chatEntity: any, messageId: number): string | undefined {
@@ -120,26 +108,88 @@ export function normalizeText(text: string): string {
 
 export function normalizeId(value: unknown): string | undefined {
   if (value === null || value === undefined) return undefined;
-  if (typeof value === "string" || typeof value === "number" || typeof value === "bigint") {
-    return String(value);
+  return typeof value === "string" || typeof value === "number" || typeof value === "bigint"
+    ? String(value)
+    : undefined;
+}
+
+function getMarkedPeerId(peer: unknown): string | undefined {
+  if (!peer) return undefined;
+  try {
+    return utils.getPeerId(peer as never);
+  } catch {
+    return undefined;
   }
-  if (
-    typeof value === "object"
-    && value
-    && typeof (value as { toString?: () => string }).toString === "function"
-  ) {
-    const stringified = (value as { toString: () => string }).toString();
-    if (stringified && stringified !== "[object Object]") {
-      return stringified;
+}
+
+function getBigIntLikeString(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  return String(value);
+}
+
+export function collectChatIdCandidates(
+  chatType: ArchiveChatType | undefined,
+  ...values: unknown[]
+): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const push = (value: string | undefined) => {
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    candidates.push(value);
+  };
+
+  for (const value of values) {
+    const normalized = normalizeId(value);
+    if (!normalized) continue;
+    push(normalized);
+
+    if (/^\d+$/.test(normalized)) {
+      if (chatType === "channel" || chatType === "supergroup" || chatType === "group") {
+        push(`-${normalized}`);
+        push(`-100${normalized}`);
+      }
+      continue;
+    }
+
+    const channelMatch = normalized.match(/^-100(\d+)$/);
+    if (channelMatch) {
+      push(channelMatch[1]);
+      push(`-${channelMatch[1]}`);
+      continue;
+    }
+
+    const groupMatch = normalized.match(/^-(\d+)$/);
+    if (groupMatch) {
+      push(groupMatch[1]);
+      push(`-100${groupMatch[1]}`);
     }
   }
-  if (typeof value !== "object") return undefined;
-  const record = value as Record<string, unknown>;
-  for (const key of ["userId", "chatId", "channelId", "senderId", "id"]) {
-    const nested = normalizeId(record[key]);
-    if (nested) return nested;
+
+  return candidates;
+}
+
+export function toCanonicalChatId(
+  chatType: ArchiveChatType | undefined,
+  ...values: unknown[]
+): string | undefined {
+  const candidates = collectChatIdCandidates(chatType, ...values);
+  if (candidates.length === 0) return undefined;
+
+  if (chatType === "channel" || chatType === "supergroup") {
+    return candidates.find((candidate) => /^-100\d+$/.test(candidate))
+      || candidates.find((candidate) => /^-\d+$/.test(candidate))
+      || candidates[0];
   }
-  return undefined;
+
+  if (chatType === "group") {
+    return candidates.find((candidate) => /^-\d+$/.test(candidate) && !/^-100\d+$/.test(candidate))
+      || candidates.find((candidate) => /^-100\d+$/.test(candidate))
+      || candidates[0];
+  }
+
+  return candidates.find((candidate) => /^-\d+$/.test(candidate))
+    || candidates[0];
 }
 
 export function getDateNumber(input: unknown): number {
@@ -166,12 +216,6 @@ export async function resolveChatContext(message: Api.Message): Promise<{
     chat = undefined;
   }
 
-  const chatId =
-    normalizeId(message.chatId)
-    || normalizeId(chat?.id)
-    || normalizeId(message.inputChat);
-  if (!chatId) return {};
-
   let chatType: ArchiveChatType | undefined;
   if (chat instanceof Api.Channel) {
     chatType = chat.megagroup ? "supergroup" : "channel";
@@ -184,41 +228,37 @@ export async function resolveChatContext(message: Api.Message): Promise<{
   }
   if (!chatType) return {};
 
+  const chatId = getMarkedPeerId(chat)
+    || getMarkedPeerId(message.inputChat)
+    || toCanonicalChatId(chatType, getBigIntLikeString(message.chatId), getBigIntLikeString(chat?.id));
+  if (!chatId) return {};
+
+  const chatTitle = chat instanceof Api.Channel || chat instanceof Api.Chat
+    ? String(chat.title || chatId)
+    : chatId;
+  const chatUsername = chat instanceof Api.Channel && chat.username
+    ? String(chat.username)
+    : undefined;
+
   return {
     chatId,
     chatType,
-    chatTitle: String(chat?.title || chat?.username || chatId),
-    chatUsername: chat?.username ? String(chat.username) : undefined,
+    chatTitle,
+    chatUsername,
     chatEntity: chat,
   };
 }
 
 async function resolveSenderContext(message: Api.Message): Promise<{
   senderId?: string;
-  senderDisplay?: string;
-  senderUsername?: string;
 }> {
-  let sender: any;
-  try {
-    sender = await message.getSender();
-  } catch {
-    sender = undefined;
-  }
-
-  const senderId = normalizeId(message.senderId) || normalizeId(sender?.id);
-  const senderDisplay = sender
-    ? buildEntityDisplay(sender, senderId || "unknown")
-    : String((message as any).postAuthor || senderId || "unknown");
-  const senderUsername = sender?.username ? String(sender.username) : undefined;
-
-  return { senderId, senderDisplay, senderUsername };
+  return { senderId: getBigIntLikeString(message.senderId) };
 }
 
 export async function buildArchiveInput(message: Api.Message): Promise<{
   chatType?: ArchiveChatType;
   chatTitle?: string;
   chatUsername?: string;
-  senderUsername?: string;
   input?: ArchiveMessageInput;
 }> {
   const chat = await resolveChatContext(message);
@@ -226,29 +266,25 @@ export async function buildArchiveInput(message: Api.Message): Promise<{
 
   const sender = await resolveSenderContext(message);
   const text = buildMessageText(message);
-  const messageId = Number((message as any).id);
+  const messageId = Number(message.id);
   if (!messageId) return {};
 
   return {
     chatType: chat.chatType,
     chatTitle: chat.chatTitle,
     chatUsername: chat.chatUsername,
-    senderUsername: sender.senderUsername,
     input: {
       chatId: chat.chatId,
       messageId,
       senderId: sender.senderId,
-      senderDisplay: sender.senderDisplay,
-      date: getDateNumber((message as any).date),
+      date: getDateNumber(message.date),
+      editDate: getDateNumber(message.editDate || message.date),
       rawText: text.rawText,
       textNormalized: normalizeText(text.rawText),
       messageType: text.messageType,
       caption: text.caption,
-      replyToMsgId:
-        (message as any).replyTo?.replyToMsgId
-        || (message as any).replyToMsgId
-        || undefined,
-      groupedId: normalizeId((message as any).groupedId),
+      replyToMsgId: message.replyToMsgId,
+      groupedId: getBigIntLikeString(message.groupedId),
       link: buildMessageLink(chat.chatEntity, messageId),
     },
   };

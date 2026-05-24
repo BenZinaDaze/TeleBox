@@ -1,8 +1,11 @@
 import Database from "better-sqlite3";
+import fs from "fs";
 import path from "path";
 import { createDirectoryInAssets } from "./pathHelpers";
 import {
+  collectChatIdCandidates,
   normalizeText,
+  toCanonicalChatId,
   type ArchiveChatType,
   type ArchiveMessageInput,
 } from "./archiveMessageBuilder";
@@ -22,9 +25,6 @@ export interface ArchiveSearchRow {
   chatId: string;
   messageId: number;
   senderId?: string;
-  senderDisplay?: string;
-  chatTitle: string;
-  chatUsername?: string;
   date: number;
   rawText: string;
   textNormalized: string;
@@ -37,7 +37,6 @@ export interface ArchiveSearchRow {
 
 export interface ArchiveStats {
   chats: number;
-  users: number;
   messages: number;
   versions: number;
   deletedMessages: number;
@@ -59,20 +58,81 @@ export interface BackfillTargetRecord {
   lastError?: string | null;
 }
 
-type ExistingMessageRow = {
+export interface ArchiveNormalizationStats {
+  aliasMappings: number;
+  chatsRewritten: number;
+  messageRowsRewritten: number;
+  mergedMessageGroups: number;
+  versionRowsRewritten: number;
+  blacklistRewritten: number;
+  backfillTargetsRewritten: number;
+  backfillJobsUpdated: number;
+  droppedChannelChats: number;
+  droppedChannelMessages: number;
+  droppedChannelVersions: number;
+}
+
+type StoredMessageRow = {
+  chat_id: string;
+  message_id: number;
+  edit_date: number;
+  sender_id: string | null;
+  date: number;
+  raw_text: string;
+  text_normalized: string;
+  message_type: string;
+  caption: string | null;
+  link: string | null;
+  is_deleted: number;
+};
+
+type LegacyMessageRow = {
   id: number;
-  latest_version: number;
+  chat_id: string;
+  message_id: number;
+  sender_id: string | null;
+  date: number;
+  raw_text: string;
+  text_normalized: string;
+  message_type: string;
+  caption: string | null;
+  link: string | null;
+  is_deleted: number;
+};
+
+type LegacyMessageVersionRow = {
+  message_row_id: number;
+  version: number;
   raw_text: string;
   text_normalized: string;
   caption: string | null;
-  sender_id: string | null;
-  sender_display: string | null;
-  message_type: string;
-  date: number;
-  reply_to_msg_id: number | null;
-  grouped_id: string | null;
-  link: string | null;
-  is_deleted: number;
+  edited_at: number;
+};
+
+type LegacyBackfillTargetRow = {
+  chat_id: string;
+  title: string;
+  username: string | null;
+  chat_type: ArchiveChatType;
+  status: BackfillTargetStatus;
+  completed_once: number;
+  cursor_message_id: number | null;
+  processed_messages: number;
+  last_backfill_started_at: number | null;
+  last_backfill_finished_at: number | null;
+  last_error: string | null;
+};
+
+type LegacyChatRow = {
+  chat_id: string;
+  chat_type: ArchiveChatType;
+};
+
+type LegacyBlacklistRow = {
+  chat_id: string;
+  title: string;
+  username: string | null;
+  created_at: number;
 };
 
 const BACKFILL_TARGET_SELECT = `
@@ -89,16 +149,28 @@ const BACKFILL_TARGET_SELECT = `
   last_error AS lastError
 `;
 
-function canUseFtsKeyword(keyword: string): boolean {
-  return /^[\p{L}\p{N}\s_-]+$/u.test(keyword);
+const ARCHIVE_DIR = createDirectoryInAssets("archive");
+const LEGACY_DB_PATH = path.join(ARCHIVE_DIR, "archive.db");
+const V2_DB_PATH = path.join(ARCHIVE_DIR, "archive_v2.db");
+
+function rowCount(db: Database.Database, tableName: string): boolean {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(tableName) as { count: number };
+  return row.count > 0;
+}
+
+function pickPreferredText(...values: Array<string | null | undefined>): string | null {
+  for (const value of values) {
+    if (value && value.trim()) return value;
+  }
+  return null;
 }
 
 export class ArchiveDB {
   private db: Database.Database;
 
-  constructor(
-    dbPath: string = path.join(createDirectoryInAssets("archive"), "archive.db")
-  ) {
+  constructor(dbPath: string = V2_DB_PATH) {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("synchronous = NORMAL");
@@ -107,67 +179,19 @@ export class ArchiveDB {
 
   private init(): void {
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS chats (
-        chat_id TEXT PRIMARY KEY,
-        chat_type TEXT NOT NULL,
-        title TEXT NOT NULL,
-        username TEXT,
-        last_seen_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS users (
-        user_id TEXT PRIMARY KEY,
-        username TEXT,
-        display_name TEXT NOT NULL,
-        last_seen_at INTEGER NOT NULL
-      );
-
       CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id TEXT NOT NULL,
         message_id INTEGER NOT NULL,
+        edit_date INTEGER NOT NULL,
         sender_id TEXT,
-        sender_display TEXT,
         date INTEGER NOT NULL,
         raw_text TEXT NOT NULL,
         text_normalized TEXT NOT NULL,
         message_type TEXT NOT NULL,
         caption TEXT,
-        reply_to_msg_id INTEGER,
-        grouped_id TEXT,
         link TEXT,
         is_deleted INTEGER NOT NULL DEFAULT 0,
-        latest_version INTEGER NOT NULL DEFAULT 1,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        UNIQUE(chat_id, message_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS message_versions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        message_row_id INTEGER NOT NULL,
-        version INTEGER NOT NULL,
-        raw_text TEXT NOT NULL,
-        text_normalized TEXT NOT NULL,
-        caption TEXT,
-        edited_at INTEGER NOT NULL,
-        edit_source TEXT NOT NULL,
-        UNIQUE(message_row_id, version)
-      );
-
-      CREATE TABLE IF NOT EXISTS backfill_jobs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        status TEXT NOT NULL,
-        window_spec TEXT,
-        started_at INTEGER NOT NULL,
-        finished_at INTEGER,
-        current_chat_id TEXT,
-        current_chat_title TEXT,
-        cursor_message_id INTEGER,
-        resume_after_current_chat INTEGER NOT NULL DEFAULT 0,
-        processed_chats INTEGER NOT NULL DEFAULT 0,
-        processed_messages INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT
+        PRIMARY KEY (chat_id, message_id, edit_date)
       );
 
       CREATE TABLE IF NOT EXISTS archive_blacklist (
@@ -191,228 +215,173 @@ export class ArchiveDB {
         last_error TEXT
       );
 
-      CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date DESC);
       CREATE INDEX IF NOT EXISTS idx_messages_sender_date ON messages(sender_id, date DESC);
+      CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date DESC);
       CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date DESC);
-      CREATE INDEX IF NOT EXISTS idx_versions_message_version ON message_versions(message_row_id, version DESC);
       CREATE INDEX IF NOT EXISTS idx_backfill_targets_status ON archive_backfill_targets(status);
-
-      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-        search_text,
-        tokenize='trigram'
-      );
     `);
 
-    const columns = this.db.prepare(`PRAGMA table_info(backfill_jobs)`).all() as Array<{ name: string }>;
-    if (!columns.some((column) => column.name === "window_spec")) {
-      this.db.exec(`ALTER TABLE backfill_jobs ADD COLUMN window_spec TEXT`);
-    }
-    if (!columns.some((column) => column.name === "resume_after_current_chat")) {
-      this.db.exec(`ALTER TABLE backfill_jobs ADD COLUMN resume_after_current_chat INTEGER NOT NULL DEFAULT 0`);
-    }
+    this.db.exec(`
+      DROP TABLE IF EXISTS users;
+      DROP TABLE IF EXISTS chats;
+      DROP TABLE IF EXISTS message_versions;
+      DROP TABLE IF EXISTS messages_fts;
+      DROP TABLE IF EXISTS messages_fts_data;
+      DROP TABLE IF EXISTS messages_fts_idx;
+      DROP TABLE IF EXISTS messages_fts_docsize;
+      DROP TABLE IF EXISTS messages_fts_config;
+      DROP TABLE IF EXISTS messages_fts_content;
+      DROP TABLE IF EXISTS backfill_jobs;
+    `);
   }
 
-  private buildSearchText(input: ArchiveMessageInput): string {
-    return [
-      input.textNormalized,
-      input.caption || "",
-      input.senderDisplay || "",
-      input.messageType || "",
-    ]
-      .filter(Boolean)
-      .join("\n");
+  private effectiveEditDate(input: ArchiveMessageInput): number {
+    return input.editDate || input.date;
   }
 
-  private replaceFtsRow(rowId: number, searchText: string): void {
-    this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(rowId);
-    this.db
-      .prepare(`INSERT INTO messages_fts(rowid, search_text) VALUES (?, ?)`)
-      .run(rowId, searchText);
+  private countVersions(chatId: string, messageId: number): number {
+    const row = this.db
+      .prepare<[string, number], { count: number }>(`
+        SELECT COUNT(*) AS count
+        FROM messages
+        WHERE chat_id = ? AND message_id = ?
+      `)
+      .get(chatId, messageId);
+    return row?.count || 0;
   }
 
-  public upsertChat(record: {
+  public upsertChat(_record?: {
     chatId: string;
     chatType: ArchiveChatType;
     title: string;
     username?: string;
     lastSeenAt: number;
   }): void {
-    this.db
-      .prepare(`
-        INSERT INTO chats (chat_id, chat_type, title, username, last_seen_at)
-        VALUES (@chatId, @chatType, @title, @username, @lastSeenAt)
-        ON CONFLICT(chat_id) DO UPDATE SET
-          chat_type = excluded.chat_type,
-          title = excluded.title,
-          username = excluded.username,
-          last_seen_at = excluded.last_seen_at
-      `)
-      .run(record);
-  }
-
-  public upsertUser(record: {
-    userId: string;
-    username?: string;
-    displayName: string;
-    lastSeenAt: number;
-  }): void {
-    this.db
-      .prepare(`
-        INSERT INTO users (user_id, username, display_name, last_seen_at)
-        VALUES (@userId, @username, @displayName, @lastSeenAt)
-        ON CONFLICT(user_id) DO UPDATE SET
-          username = excluded.username,
-          display_name = excluded.display_name,
-          last_seen_at = excluded.last_seen_at
-      `)
-      .run(record);
+    // V2 no longer stores chat metadata outside backfill target state.
   }
 
   public insertOrUpdateMessage(
     input: ArchiveMessageInput,
-    editSource: "new" | "edit" | "backfill" = "new"
+    _editSource: "new" | "edit" | "backfill" = "new"
   ): { inserted: boolean; updated: boolean; version: number } {
-    const now = Date.now();
+    const editDate = this.effectiveEditDate(input);
     const existing = this.db
-      .prepare<[string, number], ExistingMessageRow>(`
+      .prepare<[string, number, number], StoredMessageRow>(`
         SELECT *
         FROM messages
-        WHERE chat_id = ? AND message_id = ?
+        WHERE chat_id = ? AND message_id = ? AND edit_date = ?
       `)
-      .get(input.chatId, input.messageId);
+      .get(input.chatId, input.messageId, editDate);
 
     if (!existing) {
-      const result = this.db
+      this.db
         .prepare(`
           INSERT INTO messages (
-            chat_id, message_id, sender_id, sender_display, date,
-            raw_text, text_normalized, message_type, caption,
-            reply_to_msg_id, grouped_id, link, is_deleted, latest_version,
-            created_at, updated_at
+            chat_id, message_id, edit_date, sender_id, date, raw_text,
+            text_normalized, message_type, caption, link, is_deleted
           ) VALUES (
-            @chatId, @messageId, @senderId, @senderDisplay, @date,
-            @rawText, @textNormalized, @messageType, @caption,
-            @replyToMsgId, @groupedId, @link, 0, 1,
-            @createdAt, @updatedAt
+            @chatId, @messageId, @editDate, @senderId, @date, @rawText,
+            @textNormalized, @messageType, @caption, @link, 0
           )
         `)
         .run({
           ...input,
-          createdAt: now,
-          updatedAt: now,
+          editDate,
         });
 
-      const rowId = Number(result.lastInsertRowid);
-      this.db
-        .prepare(`
-          INSERT INTO message_versions (
-            message_row_id, version, raw_text, text_normalized, caption, edited_at, edit_source
-          ) VALUES (?, 1, ?, ?, ?, ?, ?)
-        `)
-        .run(
-          rowId,
-          input.rawText,
-          input.textNormalized,
-          input.caption || null,
-          now,
-          editSource
-        );
-
-      this.replaceFtsRow(rowId, this.buildSearchText(input));
-      return { inserted: true, updated: false, version: 1 };
+      return {
+        inserted: true,
+        updated: false,
+        version: this.countVersions(input.chatId, input.messageId),
+      };
     }
 
     const changed =
-      existing.raw_text !== input.rawText ||
-      existing.text_normalized !== input.textNormalized ||
-      (existing.caption || "") !== (input.caption || "") ||
-      (existing.sender_id || "") !== (input.senderId || "") ||
-      (existing.sender_display || "") !== (input.senderDisplay || "") ||
-      existing.message_type !== input.messageType ||
-      existing.date !== input.date ||
-      (existing.reply_to_msg_id || 0) !== (input.replyToMsgId || 0) ||
-      (existing.grouped_id || "") !== (input.groupedId || "") ||
-      (existing.link || "") !== (input.link || "") ||
-      existing.is_deleted !== 0;
+      (existing.sender_id || "") !== (input.senderId || "")
+      || existing.date !== input.date
+      || existing.raw_text !== input.rawText
+      || existing.text_normalized !== input.textNormalized
+      || existing.message_type !== input.messageType
+      || (existing.caption || "") !== (input.caption || "")
+      || (existing.link || "") !== (input.link || "")
+      || existing.is_deleted !== 0;
 
-    const nextVersion = changed ? existing.latest_version + 1 : existing.latest_version;
+    if (!changed) {
+      return {
+        inserted: false,
+        updated: false,
+        version: this.countVersions(input.chatId, input.messageId),
+      };
+    }
 
     this.db
       .prepare(`
         UPDATE messages
         SET sender_id = @senderId,
-            sender_display = @senderDisplay,
             date = @date,
             raw_text = @rawText,
             text_normalized = @textNormalized,
             message_type = @messageType,
             caption = @caption,
-            reply_to_msg_id = @replyToMsgId,
-            grouped_id = @groupedId,
             link = @link,
-            is_deleted = 0,
-            latest_version = @latestVersion,
-            updated_at = @updatedAt
-        WHERE id = @id
+            is_deleted = 0
+        WHERE chat_id = @chatId AND message_id = @messageId AND edit_date = @editDate
       `)
       .run({
         ...input,
-        id: existing.id,
-        latestVersion: nextVersion,
-        updatedAt: now,
+        editDate,
       });
 
-    if (changed) {
-      this.db
-        .prepare(`
-          INSERT INTO message_versions (
-            message_row_id, version, raw_text, text_normalized, caption, edited_at, edit_source
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        `)
-        .run(
-          existing.id,
-          nextVersion,
-          input.rawText,
-          input.textNormalized,
-          input.caption || null,
-          now,
-          editSource
-        );
-      this.replaceFtsRow(existing.id, this.buildSearchText(input));
-    }
-
-    return { inserted: false, updated: changed, version: nextVersion };
+    return {
+      inserted: false,
+      updated: true,
+      version: this.countVersions(input.chatId, input.messageId),
+    };
   }
 
   public markMessageDeleted(chatId: string, messageId: number): void {
-    const row = this.db
-      .prepare<[string, number], { id: number }>(`
-        SELECT id
-        FROM messages
-        WHERE chat_id = ? AND message_id = ?
-      `)
-      .get(chatId, messageId);
-
-    if (!row) return;
-
     this.db
       .prepare(`
         UPDATE messages
-        SET is_deleted = 1, updated_at = ?
-        WHERE id = ?
+        SET is_deleted = 1
+        WHERE chat_id = ? AND message_id = ? AND edit_date = (
+          SELECT MAX(edit_date)
+          FROM messages
+          WHERE chat_id = ? AND message_id = ?
+        )
       `)
-      .run(Date.now(), row.id);
-    this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(row.id);
+      .run(chatId, messageId, chatId, messageId);
   }
 
   public getStats(): ArchiveStats {
-    const chats = this.db.prepare(`SELECT COUNT(*) AS count FROM chats`).get() as { count: number };
-    const users = this.db.prepare(`SELECT COUNT(*) AS count FROM users`).get() as { count: number };
-    const messages = this.db.prepare(`SELECT COUNT(*) AS count FROM messages`).get() as { count: number };
-    const versions = this.db.prepare(`SELECT COUNT(*) AS count FROM message_versions`).get() as { count: number };
-    const deleted = this.db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE is_deleted = 1`).get() as {
-      count: number;
-    };
+    const chats = this.db.prepare(`
+      SELECT COUNT(DISTINCT chat_id) AS count
+      FROM messages
+    `).get() as { count: number };
+    const latestMessages = this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM (
+        SELECT chat_id, message_id
+        FROM messages
+        GROUP BY chat_id, message_id
+      )
+    `).get() as { count: number };
+    const versions = this.db.prepare(`SELECT COUNT(*) AS count FROM messages`).get() as { count: number };
+    const deleted = this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM (
+        SELECT m.*
+        FROM messages m
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM messages newer
+          WHERE newer.chat_id = m.chat_id
+            AND newer.message_id = m.message_id
+            AND newer.edit_date > m.edit_date
+        )
+          AND m.is_deleted = 1
+      )
+    `).get() as { count: number };
     const blacklisted = this.db.prepare(`SELECT COUNT(*) AS count FROM archive_blacklist`).get() as {
       count: number;
     };
@@ -421,8 +390,7 @@ export class ArchiveDB {
 
     return {
       chats: chats.count,
-      users: users.count,
-      messages: messages.count,
+      messages: latestMessages.count,
       versions: versions.count,
       deletedMessages: deleted.count,
       blacklistedChats: blacklisted.count,
@@ -436,26 +404,19 @@ export class ArchiveDB {
       `NOT EXISTS (SELECT 1 FROM archive_blacklist bl WHERE bl.chat_id = m.chat_id)`,
     ];
     const values: Array<string | number> = [];
-    let fromClause = `messages m`;
 
     if (params.keyword) {
       const keyword = params.keyword.trim();
-      if (keyword.length >= 3 && canUseFtsKeyword(keyword)) {
-        fromClause = `messages_fts f JOIN messages m ON m.id = f.rowid`;
-        where.push(`f.search_text MATCH ?`);
-        values.push(keyword);
-      } else {
-        where.push(`(
-          m.text_normalized LIKE ?
-          OR m.raw_text LIKE ?
-          OR COALESCE(m.caption, '') LIKE ?
-          OR COALESCE(m.sender_display, '') LIKE ?
-        )`);
-        values.push(`%${normalizeText(keyword)}%`);
-        values.push(`%${keyword}%`);
-        values.push(`%${keyword}%`);
-        values.push(`%${keyword}%`);
-      }
+      where.push(`(
+        m.text_normalized LIKE ?
+        OR m.raw_text LIKE ?
+        OR COALESCE(m.caption, '') LIKE ?
+        OR m.message_type LIKE ?
+      )`);
+      values.push(`%${normalizeText(keyword)}%`);
+      values.push(`%${keyword}%`);
+      values.push(`%${keyword}%`);
+      values.push(`%${keyword}%`);
     }
 
     if (params.chatId) {
@@ -481,42 +442,61 @@ export class ArchiveDB {
         m.chat_id AS chatId,
         m.message_id AS messageId,
         m.sender_id AS senderId,
-        m.sender_display AS senderDisplay,
-        c.title AS chatTitle,
-        c.username AS chatUsername,
         m.date,
         m.raw_text AS rawText,
         m.text_normalized AS textNormalized,
         m.message_type AS messageType,
         m.caption,
         m.link,
-        m.latest_version AS latestVersion,
+        (
+          SELECT COUNT(*)
+          FROM messages versions
+          WHERE versions.chat_id = m.chat_id AND versions.message_id = m.message_id
+        ) AS latestVersion,
         m.is_deleted AS isDeleted
-      FROM ${fromClause}
-      LEFT JOIN chats c ON c.chat_id = m.chat_id
-      WHERE ${where.join(" AND ")}
+      FROM messages m
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM messages newer
+        WHERE newer.chat_id = m.chat_id
+          AND newer.message_id = m.message_id
+          AND newer.edit_date > m.edit_date
+      )
+        AND ${where.join(" AND ")}
       ORDER BY m.date DESC
       LIMIT ?
     `).all(...values) as ArchiveSearchRow[];
   }
 
-  public isChatBlacklisted(chatId: string): boolean {
-    const row = this.db
-      .prepare<[string], { found: number }>(`
-        SELECT 1 AS found
-        FROM archive_blacklist
-        WHERE chat_id = ?
-        LIMIT 1
-      `)
-      .get(chatId);
-    return !!row;
+  public isChatBlacklisted(chatId: string | string[]): boolean {
+    return !!this.findBlacklistedChat(chatId);
   }
 
   public addChatBlacklist(record: {
     chatId: string;
     title: string;
     username?: string;
+    matchChatIds?: string[];
   }): void {
+    const existing = this.findBlacklistedChat(record.matchChatIds || record.chatId);
+    if (existing && existing.chatId !== record.chatId) {
+      this.db
+        .prepare(`
+          UPDATE archive_blacklist
+          SET chat_id = @chatId,
+              title = @title,
+              username = @username
+          WHERE chat_id = @existingChatId
+        `)
+        .run({
+          chatId: record.chatId,
+          title: record.title,
+          username: record.username,
+          existingChatId: existing.chatId,
+        });
+      return;
+    }
+
     this.db
       .prepare(`
         INSERT INTO archive_blacklist (chat_id, title, username, created_at)
@@ -531,10 +511,12 @@ export class ArchiveDB {
       });
   }
 
-  public removeChatBlacklist(chatId: string): boolean {
+  public removeChatBlacklist(chatId: string | string[]): boolean {
+    const existing = this.findBlacklistedChat(chatId);
+    if (!existing) return false;
     const result = this.db
       .prepare(`DELETE FROM archive_blacklist WHERE chat_id = ?`)
-      .run(chatId);
+      .run(existing.chatId);
     return result.changes > 0;
   }
 
@@ -560,6 +542,24 @@ export class ArchiveDB {
         ORDER BY created_at DESC
       `)
       .all();
+  }
+
+  private findBlacklistedChat(chatIds: string | string[]): { chatId: string } | undefined {
+    const ids = Array.isArray(chatIds)
+      ? Array.from(new Set(chatIds.filter(Boolean)))
+      : chatIds
+        ? [chatIds]
+        : [];
+    if (ids.length === 0) return undefined;
+
+    return this.db
+      .prepare<string[], { chatId: string }>(`
+        SELECT chat_id AS chatId
+        FROM archive_blacklist
+        WHERE chat_id IN (${ids.map(() => "?").join(", ")})
+        LIMIT 1
+      `)
+      .get(...ids);
   }
 
   public upsertBackfillTargetMeta(record: {
@@ -661,6 +661,236 @@ export class ArchiveDB {
       failed: rows.find((row) => row.status === "failed")?.count || 0,
       stopped: rows.find((row) => row.status === "stopped")?.count || 0,
     };
+  }
+
+  public normalizeChatIds(aliasToCanonicalInput: Map<string, string> | Record<string, string>): ArchiveNormalizationStats {
+    const aliasToCanonical = aliasToCanonicalInput instanceof Map
+      ? aliasToCanonicalInput
+      : new Map(Object.entries(aliasToCanonicalInput));
+
+    const stats: ArchiveNormalizationStats = {
+      aliasMappings: aliasToCanonical.size,
+      chatsRewritten: 0,
+      messageRowsRewritten: 0,
+      mergedMessageGroups: 0,
+      versionRowsRewritten: 0,
+      blacklistRewritten: 0,
+      backfillTargetsRewritten: 0,
+      backfillJobsUpdated: 0,
+      droppedChannelChats: 0,
+      droppedChannelMessages: 0,
+      droppedChannelVersions: 0,
+    };
+
+    if (!fs.existsSync(LEGACY_DB_PATH) || path.resolve(LEGACY_DB_PATH) === path.resolve(V2_DB_PATH)) {
+      return stats;
+    }
+
+    const legacy = new Database(LEGACY_DB_PATH, { readonly: true });
+    try {
+      const hasMessages = rowCount(legacy, "messages");
+      const hasVersions = rowCount(legacy, "message_versions");
+      const hasChats = rowCount(legacy, "chats");
+      const hasBackfillTargets = rowCount(legacy, "archive_backfill_targets");
+      const hasBlacklist = rowCount(legacy, "archive_blacklist");
+      const hasBackfillJobs = rowCount(legacy, "backfill_jobs");
+      if (!hasMessages) return stats;
+
+      const legacyChats = hasChats
+        ? legacy.prepare<[], LegacyChatRow>(`SELECT chat_id, chat_type FROM chats`).all()
+        : [];
+      const legacyTargets = hasBackfillTargets
+        ? legacy.prepare<[], LegacyBackfillTargetRow>(`
+            SELECT
+              chat_id,
+              title,
+              username,
+              chat_type,
+              status,
+              completed_once,
+              cursor_message_id,
+              processed_messages,
+              last_backfill_started_at,
+              last_backfill_finished_at,
+              last_error
+            FROM archive_backfill_targets
+          `).all()
+        : [];
+      const typeHints = new Map<string, ArchiveChatType>();
+      for (const row of legacyChats) {
+        typeHints.set(row.chat_id, row.chat_type);
+        for (const candidate of collectChatIdCandidates(row.chat_type, row.chat_id)) {
+          typeHints.set(candidate, row.chat_type);
+        }
+      }
+      for (const row of legacyTargets) {
+        typeHints.set(row.chat_id, row.chat_type);
+        for (const candidate of collectChatIdCandidates(row.chat_type, row.chat_id)) {
+          typeHints.set(candidate, row.chat_type);
+        }
+      }
+
+      const resolveCanonicalChatId = (chatId: string, chatType?: ArchiveChatType): string => {
+        const candidates = collectChatIdCandidates(chatType || typeHints.get(chatId), chatId);
+        for (const candidate of candidates) {
+          const mapped = aliasToCanonical.get(candidate);
+          if (mapped) return mapped;
+        }
+        return toCanonicalChatId(chatType || typeHints.get(chatId), chatId) || chatId;
+      };
+
+      const droppedChannelChatIds = new Set<string>();
+      for (const row of legacyChats) {
+        if (row.chat_type === "channel") {
+          droppedChannelChatIds.add(resolveCanonicalChatId(row.chat_id, row.chat_type));
+        }
+      }
+      for (const row of legacyTargets) {
+        if (row.chat_type === "channel") {
+          droppedChannelChatIds.add(resolveCanonicalChatId(row.chat_id, row.chat_type));
+        }
+      }
+      stats.droppedChannelChats = droppedChannelChatIds.size;
+
+      if (hasBlacklist) {
+        const rows = legacy.prepare<[], LegacyBlacklistRow>(`
+          SELECT chat_id, title, username, created_at
+          FROM archive_blacklist
+        `).all();
+        for (const row of rows) {
+          const chatId = resolveCanonicalChatId(row.chat_id);
+          if (droppedChannelChatIds.has(chatId)) continue;
+          this.addChatBlacklist({
+            chatId,
+            title: row.title,
+            username: row.username || undefined,
+            matchChatIds: collectChatIdCandidates(typeHints.get(row.chat_id), row.chat_id, chatId),
+          });
+          stats.blacklistRewritten += 1;
+        }
+      }
+
+      for (const row of legacyTargets) {
+        const chatId = resolveCanonicalChatId(row.chat_id, row.chat_type);
+        if (droppedChannelChatIds.has(chatId)) continue;
+        this.upsertBackfillTargetMeta({
+          chatId,
+          title: row.title,
+          username: row.username || undefined,
+          chatType: row.chat_type,
+        });
+        this.updateBackfillTarget(chatId, {
+          status: row.status,
+          completedOnce: row.completed_once > 0,
+          cursorMessageId: row.cursor_message_id || undefined,
+          processedMessages: row.processed_messages,
+          lastBackfillStartedAt: row.last_backfill_started_at,
+          lastBackfillFinishedAt: row.last_backfill_finished_at,
+          lastError: row.last_error,
+        });
+        stats.backfillTargetsRewritten += 1;
+      }
+
+      if (hasBackfillJobs) {
+        const row = legacy.prepare(`
+          SELECT COUNT(*) AS count
+          FROM backfill_jobs
+          WHERE current_chat_id IS NOT NULL
+        `).get() as { count: number };
+        stats.backfillJobsUpdated = row.count;
+      }
+
+      const legacyMessages = legacy.prepare<[], LegacyMessageRow>(`
+        SELECT
+          id,
+          chat_id,
+          message_id,
+          sender_id,
+          date,
+          raw_text,
+          text_normalized,
+          message_type,
+          caption,
+          link,
+          is_deleted
+        FROM messages
+        ORDER BY id ASC
+      `).all();
+
+      const versionsByMessageRowId = new Map<number, LegacyMessageVersionRow[]>();
+      if (hasVersions) {
+        const rows = legacy.prepare<[], LegacyMessageVersionRow>(`
+          SELECT
+            message_row_id,
+            version,
+            raw_text,
+            text_normalized,
+            caption,
+            edited_at
+          FROM message_versions
+          ORDER BY message_row_id ASC, version ASC, edited_at ASC
+        `).all();
+        for (const row of rows) {
+          const bucket = versionsByMessageRowId.get(row.message_row_id) || [];
+          bucket.push(row);
+          versionsByMessageRowId.set(row.message_row_id, bucket);
+        }
+      }
+
+      const seenMessages = new Set<string>();
+      for (const row of legacyMessages) {
+        const chatId = resolveCanonicalChatId(row.chat_id, typeHints.get(row.chat_id));
+        if (droppedChannelChatIds.has(chatId)) {
+          stats.droppedChannelMessages += 1;
+          stats.droppedChannelVersions += (versionsByMessageRowId.get(row.id) || []).length;
+          continue;
+        }
+        seenMessages.add(`${chatId}\u0000${row.message_id}`);
+        const versions = versionsByMessageRowId.get(row.id) || [];
+        if (versions.length === 0) {
+          this.insertOrUpdateMessage({
+            chatId,
+            messageId: row.message_id,
+            senderId: row.sender_id || undefined,
+            date: row.date,
+            editDate: row.date,
+            rawText: row.raw_text,
+            textNormalized: row.text_normalized,
+            messageType: row.message_type,
+            caption: row.caption || undefined,
+            link: row.link || undefined,
+          }, "backfill");
+          if (row.is_deleted) this.markMessageDeleted(chatId, row.message_id);
+          stats.messageRowsRewritten += 1;
+          stats.versionRowsRewritten += 1;
+          continue;
+        }
+
+        for (const version of versions) {
+          const effectiveEditDate = version.version === 1 ? row.date : Math.max(version.edited_at, row.date);
+          this.insertOrUpdateMessage({
+            chatId,
+            messageId: row.message_id,
+            senderId: row.sender_id || undefined,
+            date: row.date,
+            editDate: effectiveEditDate,
+            rawText: version.raw_text,
+            textNormalized: version.text_normalized,
+            messageType: row.message_type,
+            caption: version.caption || undefined,
+            link: row.link || undefined,
+          }, "backfill");
+          stats.versionRowsRewritten += 1;
+        }
+        if (row.is_deleted) this.markMessageDeleted(chatId, row.message_id);
+        stats.messageRowsRewritten += 1;
+      }
+
+      stats.chatsRewritten = new Set(Array.from(seenMessages, (value) => value.split("\u0000")[0])).size;
+      return stats;
+    } finally {
+      legacy.close();
+    }
   }
 
   public close(): void {
