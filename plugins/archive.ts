@@ -628,7 +628,22 @@ class ArchivePlugin extends Plugin {
 
     const db = new ArchiveDB();
     try {
-      const stats = db.normalizeChatIds(new Map());
+      let lastProgressText = "";
+      const stats = await db.normalizeChatIds(new Map(), async (progress) => {
+        const text = [
+          "⏳ 正在从旧 DB 迁移到新 DB",
+          "",
+          `<b>阶段:</b> ${htmlEscape(progress.stage)}`,
+          `<b>进度:</b> ${htmlEscape(progress.detail)}`,
+        ].join("\n");
+        if (text === lastProgressText) return;
+        lastProgressText = text;
+        await msg.edit({
+          text,
+          parseMode: "html",
+          linkPreview: false,
+        }).catch(() => undefined);
+      });
       await msg.edit({
         text: this.formatNormalizationStats(stats),
         parseMode: "html",

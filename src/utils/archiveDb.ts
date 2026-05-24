@@ -72,6 +72,11 @@ export interface ArchiveNormalizationStats {
   droppedChannelVersions: number;
 }
 
+export interface ArchiveNormalizationProgress {
+  stage: string;
+  detail: string;
+}
+
 type StoredMessageRow = {
   chat_id: string;
   message_id: number;
@@ -663,7 +668,10 @@ export class ArchiveDB {
     };
   }
 
-  public normalizeChatIds(aliasToCanonicalInput: Map<string, string> | Record<string, string>): ArchiveNormalizationStats {
+  public async normalizeChatIds(
+    aliasToCanonicalInput: Map<string, string> | Record<string, string>,
+    onProgress?: (progress: ArchiveNormalizationProgress) => Promise<void> | void
+  ): Promise<ArchiveNormalizationStats> {
     const aliasToCanonical = aliasToCanonicalInput instanceof Map
       ? aliasToCanonicalInput
       : new Map(Object.entries(aliasToCanonicalInput));
@@ -686,8 +694,13 @@ export class ArchiveDB {
       return stats;
     }
 
+    const emit = async (stage: string, detail: string) => {
+      await onProgress?.({ stage, detail });
+    };
+
     const legacy = new Database(LEGACY_DB_PATH, { readonly: true });
     try {
+      await emit("scan", "检查旧 DB 结构");
       const hasMessages = rowCount(legacy, "messages");
       const hasVersions = rowCount(legacy, "message_versions");
       const hasChats = rowCount(legacy, "chats");
@@ -696,6 +709,7 @@ export class ArchiveDB {
       const hasBackfillJobs = rowCount(legacy, "backfill_jobs");
       if (!hasMessages) return stats;
 
+      await emit("scan", "读取旧会话与 backfill 元数据");
       const legacyChats = hasChats
         ? legacy.prepare<[], LegacyChatRow>(`SELECT chat_id, chat_type FROM chats`).all()
         : [];
@@ -753,6 +767,7 @@ export class ArchiveDB {
       stats.droppedChannelChats = droppedChannelChatIds.size;
 
       if (hasBlacklist) {
+        await emit("blacklist", "迁移黑名单");
         const rows = legacy.prepare<[], LegacyBlacklistRow>(`
           SELECT chat_id, title, username, created_at
           FROM archive_blacklist
@@ -770,6 +785,7 @@ export class ArchiveDB {
         }
       }
 
+      await emit("targets", "迁移 backfill 列表状态");
       for (const row of legacyTargets) {
         const chatId = resolveCanonicalChatId(row.chat_id, row.chat_type);
         if (droppedChannelChatIds.has(chatId)) continue;
@@ -800,6 +816,7 @@ export class ArchiveDB {
         stats.backfillJobsUpdated = row.count;
       }
 
+      await emit("messages", "读取旧消息与版本");
       const legacyMessages = legacy.prepare<[], LegacyMessageRow>(`
         SELECT
           id,
@@ -838,6 +855,7 @@ export class ArchiveDB {
       }
 
       const seenMessages = new Set<string>();
+      await emit("messages", `开始迁移 ${legacyMessages.length} 条旧消息`);
       for (const row of legacyMessages) {
         const chatId = resolveCanonicalChatId(row.chat_id, typeHints.get(row.chat_id));
         if (droppedChannelChatIds.has(chatId)) {
@@ -863,30 +881,33 @@ export class ArchiveDB {
           if (row.is_deleted) this.markMessageDeleted(chatId, row.message_id);
           stats.messageRowsRewritten += 1;
           stats.versionRowsRewritten += 1;
-          continue;
+        } else {
+          for (const version of versions) {
+            const effectiveEditDate = version.version === 1 ? row.date : Math.max(version.edited_at, row.date);
+            this.insertOrUpdateMessage({
+              chatId,
+              messageId: row.message_id,
+              senderId: row.sender_id || undefined,
+              date: row.date,
+              editDate: effectiveEditDate,
+              rawText: version.raw_text,
+              textNormalized: version.text_normalized,
+              messageType: row.message_type,
+              caption: version.caption || undefined,
+              link: row.link || undefined,
+            }, "backfill");
+            stats.versionRowsRewritten += 1;
+          }
+          if (row.is_deleted) this.markMessageDeleted(chatId, row.message_id);
+          stats.messageRowsRewritten += 1;
         }
-
-        for (const version of versions) {
-          const effectiveEditDate = version.version === 1 ? row.date : Math.max(version.edited_at, row.date);
-          this.insertOrUpdateMessage({
-            chatId,
-            messageId: row.message_id,
-            senderId: row.sender_id || undefined,
-            date: row.date,
-            editDate: effectiveEditDate,
-            rawText: version.raw_text,
-            textNormalized: version.text_normalized,
-            messageType: row.message_type,
-            caption: version.caption || undefined,
-            link: row.link || undefined,
-          }, "backfill");
-          stats.versionRowsRewritten += 1;
+        if (stats.messageRowsRewritten > 0 && stats.messageRowsRewritten % 200 === 0) {
+          await emit("messages", `已迁移 ${stats.messageRowsRewritten}/${legacyMessages.length} 条消息`);
         }
-        if (row.is_deleted) this.markMessageDeleted(chatId, row.message_id);
-        stats.messageRowsRewritten += 1;
       }
 
       stats.chatsRewritten = new Set(Array.from(seenMessages, (value) => value.split("\u0000")[0])).size;
+      await emit("done", `迁移完成，共 ${stats.messageRowsRewritten} 条消息，${stats.versionRowsRewritten} 个版本`);
       return stats;
     } finally {
       legacy.close();
