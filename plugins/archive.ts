@@ -33,6 +33,7 @@ const MAX_CHUNK_LENGTH = 3500;
 const BACKFILL_LIST_PAGE_SIZE = 10;
 const BACKFILL_BATCH_SIZE = 100;
 const BACKFILL_BATCH_PAUSE_MS = 2000;
+const BACKFILL_NO_PROGRESS_TIMEOUT_MS = 5 * 60 * 1000;
 const MANUAL_BACKFILL_STOP_REASON = "Archive backfill stopped by command";
 
 type ArchiveRuntimeStats = {
@@ -65,6 +66,7 @@ type ActiveBackfillRuntime = {
   title: string;
   processedMessages: number;
   cursorMessageId?: number;
+  lastProgressAt: number;
 };
 
 function createRuntimeStats(): ArchiveRuntimeStats {
@@ -581,6 +583,7 @@ class ArchivePlugin extends Plugin {
           `<b>当前运行:</b> ${htmlEscape(this.activeBackfill.title)} <code>${htmlEscape(this.activeBackfill.chatId)}</code>`
         );
         lines.push(`<b>运行中已处理消息:</b> ${this.activeBackfill.processedMessages}`);
+        lines.push(`<b>最后进展:</b> ${formatTime(this.activeBackfill.lastProgressAt)}`);
       } else {
         lines.push("<b>当前运行:</b> 无");
       }
@@ -923,6 +926,7 @@ class ArchivePlugin extends Plugin {
       title: target.title,
       processedMessages: options.processedMessages,
       cursorMessageId: options.cursorMessageId,
+      lastProgressAt: Date.now(),
     };
     this.backfillAbortController = new AbortController();
     this.backfillPromise = this.lifecycle.runTask(
@@ -981,11 +985,22 @@ class ArchivePlugin extends Plugin {
       if (cursorMessageId) {
         iterOptions.minId = cursorMessageId;
       }
+      const iterator = client.iterMessages(target.inputEntity, iterOptions)[Symbol.asyncIterator]();
 
       while (true) {
         try {
-          for await (const message of client.iterMessages(target.inputEntity, iterOptions)) {
+          while (true) {
             throwIfAborted(signal);
+            const next = await this.getNextBackfillMessage(iterator, signal, {
+              chatId: target.chatId,
+              title: target.title,
+              processedMessages,
+              cursorMessageId,
+            });
+            if (next.done) {
+              break;
+            }
+            const message = next.value;
             const archive = await buildArchiveInput(message as Api.Message);
             if (!archive.input) continue;
             db.insertOrUpdateMessage(archive.input, "backfill");
@@ -995,6 +1010,7 @@ class ArchivePlugin extends Plugin {
             if (this.activeBackfill?.chatId === target.chatId) {
               this.activeBackfill.processedMessages = processedMessages;
               this.activeBackfill.cursorMessageId = cursorMessageId;
+              this.activeBackfill.lastProgressAt = Date.now();
             }
 
             if (processedMessages % BACKFILL_BATCH_SIZE === 0) {
@@ -1283,6 +1299,33 @@ class ArchivePlugin extends Plugin {
         reason || (isManualStop ? MANUAL_BACKFILL_STOP_REASON : "Runtime reload aborted archive backfill")
       ),
     });
+  }
+
+  private async getNextBackfillMessage(
+    iterator: AsyncIterator<Api.Message>,
+    signal: AbortSignal,
+    context: {
+      chatId: string;
+      title: string;
+      processedMessages: number;
+      cursorMessageId?: number;
+    }
+  ): Promise<IteratorResult<Api.Message>> {
+    const task = iterator.next();
+    const timeoutTask = this.requireLifecycle()
+      .delay(BACKFILL_NO_PROGRESS_TIMEOUT_MS, {
+        label: `archive:backfill-no-progress-timeout:${context.chatId}`,
+      })
+      .then(() => "timeout" as const);
+
+    const result = await Promise.race([task, timeoutTask]);
+    if (result === "timeout") {
+      throw new Error(
+        `Archive backfill no progress for ${Math.round(BACKFILL_NO_PROGRESS_TIMEOUT_MS / 60000)} minutes: ${context.title} (${context.chatId}), processed=${context.processedMessages}, cursor=${context.cursorMessageId || 0}`
+      );
+    }
+    throwIfAborted(signal);
+    return result;
   }
 }
 
