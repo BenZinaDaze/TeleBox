@@ -40,10 +40,16 @@ type ProviderConfig = {
   models?: string[];
 };
 
+type RoleCollection = Record<string, string>;
+
 type DsConfig = {
   text: RouteConfig;
   vision: RouteConfig;
-  systemPrompt: string;
+  roles: {
+    builtin: RoleCollection;
+    custom: RoleCollection;
+  };
+  activeRoles: Record<RouteKind, string>;
   keys: Record<KeyProviderId, string>;
   providers: Record<ProviderId, ProviderConfig>;
   cursors: Record<RouteKind, number>;
@@ -105,6 +111,19 @@ const ARK_BALANCED_MODELS = [
   "doubao-seed-2-0-pro-260215",
   "doubao-seed-2-0-mini-260428",
 ];
+const DEFAULT_ROLE_NAME = "default";
+const BUILTIN_ROLE_PROMPTS = {
+  default:
+    "你是一个乐于助人、简洁且无害的AI助手。始终以清晰、结构良好的语言回复。适当时使用项目符号或编号列表。如果你不知道答案，直接说出来。不要编造信息。",
+  coder:
+    "你是一个严谨的编程助手。优先给出可执行的方案、明确的代码修改建议和必要的边界条件。不要编造不存在的 API 或行为。",
+  translator:
+    "你是一个专业翻译助手。准确保留原意、语气和专有名词；必要时给出更自然的表达，并避免过度解释。",
+  summarizer:
+    "你是一个高密度总结助手。优先提炼结论、关键信息和行动项，用尽量短的结构化表达输出。",
+  "vision-ocr":
+    "你是一个偏 OCR 和视觉理解的助手。优先提取图片中的可见文字，再结合版式和图像内容进行保守判断；看不清时明确说明，不要臆测。",
+} as const satisfies Record<string, string>;
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0] || ".";
 const CONFIG_PATH = path.join(
@@ -166,8 +185,14 @@ const DEFAULT_CONFIG: DsConfig = {
   vision: {
     provider: "ark",
   },
-  systemPrompt:
-    "你是一个乐于助人、简洁且无害的AI助手。始终以清晰、结构良好的语言回复。适当时使用项目符号或编号列表。如果你不知道答案，直接说出来。不要编造信息。",
+  roles: {
+    builtin: { ...BUILTIN_ROLE_PROMPTS },
+    custom: {},
+  },
+  activeRoles: {
+    text: DEFAULT_ROLE_NAME,
+    vision: DEFAULT_ROLE_NAME,
+  },
   keys: {
     deepseek: "",
     siliconflow: "",
@@ -308,6 +333,57 @@ function normalizeModelList(value: unknown): string[] {
   return [];
 }
 
+function normalizeRoleName(value?: string | null): string {
+  return (value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9_-]/g, "");
+}
+
+function normalizeRoleCollection(value: unknown): RoleCollection {
+  if (!value || typeof value !== "object") return {};
+
+  const normalized: RoleCollection = {};
+  for (const [rawKey, rawPrompt] of Object.entries(value as Record<string, unknown>)) {
+    const key = normalizeRoleName(rawKey);
+    const prompt = typeof rawPrompt === "string" ? rawPrompt.trim() : "";
+    if (!key || !prompt) continue;
+    normalized[key] = prompt;
+  }
+  return normalized;
+}
+
+function getBuiltinRoles(): RoleCollection {
+  return { ...BUILTIN_ROLE_PROMPTS };
+}
+
+function hasRole(config: DsConfig, roleName: string): boolean {
+  return !!getRolePrompt(config, roleName);
+}
+
+function getRolePrompt(config: DsConfig, roleName: string): string {
+  const normalized = normalizeRoleName(roleName);
+  if (!normalized) return "";
+  return config.roles.custom[normalized] || config.roles.builtin[normalized] || "";
+}
+
+function isBuiltinRole(roleName: string): boolean {
+  return Object.prototype.hasOwnProperty.call(BUILTIN_ROLE_PROMPTS, normalizeRoleName(roleName));
+}
+
+function resolveRoleForRoute(config: DsConfig, route: RouteKind): { name: string; prompt: string } {
+  const activeName = normalizeRoleName(config.activeRoles[route]) || DEFAULT_ROLE_NAME;
+  const prompt = getRolePrompt(config, activeName);
+  if (prompt) {
+    return { name: activeName, prompt };
+  }
+  return {
+    name: DEFAULT_ROLE_NAME,
+    prompt: getRolePrompt(config, DEFAULT_ROLE_NAME),
+  };
+}
+
 function getDefaultRouteModel(route: RouteKind, providerId: ProviderId): string {
   const provider = PROVIDERS[providerId];
   return provider.model || DEFAULT_CONFIG.providers[providerId].model || "";
@@ -366,6 +442,41 @@ function normalizeConfig(raw?: unknown): DsConfig {
   const rawCursors = record.cursors && typeof record.cursors === "object"
     ? (record.cursors as Record<string, unknown>)
     : {};
+  const rawRoles = record.roles && typeof record.roles === "object"
+    ? (record.roles as Record<string, unknown>)
+    : {};
+  const rawBuiltinRoles = rawRoles.builtin;
+  const rawCustomRoles = rawRoles.custom;
+  const rawActiveRoles = record.activeRoles && typeof record.activeRoles === "object"
+    ? (record.activeRoles as Record<string, unknown>)
+    : {};
+  const legacySystemPrompt = typeof record.systemPrompt === "string" ? record.systemPrompt.trim() : "";
+
+  const builtinRoles = {
+    ...getBuiltinRoles(),
+    ...normalizeRoleCollection(rawBuiltinRoles),
+  };
+  const customRoles = normalizeRoleCollection(rawCustomRoles);
+
+  let activeTextRole = normalizeRoleName(
+    typeof rawActiveRoles.text === "string" ? rawActiveRoles.text : "",
+  );
+  let activeVisionRole = normalizeRoleName(
+    typeof rawActiveRoles.vision === "string" ? rawActiveRoles.vision : "",
+  );
+
+  if (!activeTextRole && !activeVisionRole && legacySystemPrompt) {
+    customRoles.legacy = legacySystemPrompt;
+    activeTextRole = "legacy";
+    activeVisionRole = "legacy";
+  }
+
+  if (!activeTextRole || (!customRoles[activeTextRole] && !builtinRoles[activeTextRole])) {
+    activeTextRole = DEFAULT_ROLE_NAME;
+  }
+  if (!activeVisionRole || (!customRoles[activeVisionRole] && !builtinRoles[activeVisionRole])) {
+    activeVisionRole = DEFAULT_ROLE_NAME;
+  }
 
   return {
     text: {
@@ -374,7 +485,14 @@ function normalizeConfig(raw?: unknown): DsConfig {
     vision: {
       provider: normalizeRouteProvider("vision", typeof rawVision.provider === "string" ? rawVision.provider : ""),
     },
-    systemPrompt: typeof record.systemPrompt === "string" ? record.systemPrompt.trim() : "",
+    roles: {
+      builtin: builtinRoles,
+      custom: customRoles,
+    },
+    activeRoles: {
+      text: activeTextRole,
+      vision: activeVisionRole,
+    },
     keys: {
       deepseek: typeof rawKeys.deepseek === "string" ? rawKeys.deepseek.trim() : "",
       siliconflow: typeof rawKeys.siliconflow === "string" ? rawKeys.siliconflow.trim() : "",
@@ -466,6 +584,16 @@ function getRouteProviderDescription(route: RouteKind, provider: ProviderDefinit
   return `${route} <code>${escapeHtml(provider.id)}</code> - ${mode}`;
 }
 
+function routeShortLabel(route: RouteKind): string {
+  return route === "text" ? "text" : "vision";
+}
+
+function truncatePreview(text: string, maxChars: number): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, maxChars)}…`;
+}
+
 function buildTextPrompt(question: string, repliedText?: string): string {
   if (repliedText && question) {
     return `被回复消息：\n${repliedText}\n\n当前问题：\n${question}`;
@@ -496,8 +624,9 @@ function buildVisionTextBlock(question: string, caption: string): string {
 
 function buildMessages(config: DsConfig, context: AskContext): ChatMessage[] {
   const messages: ChatMessage[] = [];
-  if (config.systemPrompt) {
-    messages.push({ role: "system", content: config.systemPrompt });
+  const resolvedRole = resolveRoleForRoute(config, context.route);
+  if (resolvedRole.prompt) {
+    messages.push({ role: "system", content: resolvedRole.prompt });
   }
 
   if (context.route === "vision") {
@@ -812,6 +941,35 @@ class DsConfigStore {
     });
   }
 
+  async setActiveRole(route: RouteKind, roleName: string): Promise<DsConfig> {
+    return this.update((config) => {
+      const normalized = normalizeRoleName(roleName);
+      if (hasRole(config, normalized)) {
+        config.activeRoles[route] = normalized;
+      }
+    });
+  }
+
+  async resetActiveRole(route: RouteKind): Promise<DsConfig> {
+    return this.update((config) => {
+      config.activeRoles[route] = DEFAULT_ROLE_NAME;
+    });
+  }
+
+  async setCustomRole(roleName: string, prompt: string): Promise<DsConfig> {
+    return this.update((config) => {
+      const normalized = normalizeRoleName(roleName);
+      if (!normalized) return;
+      config.roles.custom[normalized] = prompt.trim();
+    });
+  }
+
+  async deleteCustomRole(roleName: string): Promise<DsConfig> {
+    return this.update((config) => {
+      delete config.roles.custom[normalizeRoleName(roleName)];
+    });
+  }
+
   async selectRouteModel(route: RouteKind): Promise<RouteSelection> {
     const config = await this.get();
     const provider = getRouteProvider(route, config[route].provider) || getDefaultRouteProvider(route);
@@ -942,6 +1100,13 @@ class DsPlugin extends Plugin {
             `<code>${mainPrefix}ds key &lt;provider&gt; &lt;apiKey&gt;</code> - 设置 API Key`,
             `<code>${mainPrefix}ds model set &lt;provider&gt; &lt;model&gt;</code> - 设置 provider 的单模型`,
             `<code>${mainPrefix}ds models set &lt;provider&gt; &lt;m1,m2,m3&gt;</code> - 设置 provider 的轮询模型池`,
+            `<code>${mainPrefix}ds role list</code> - 查看全部 system role`,
+            `<code>${mainPrefix}ds role use text|vision &lt;name&gt;</code> - 切换路由 role`,
+            `<code>${mainPrefix}ds role add &lt;name&gt;</code> - 回复一条消息，创建自定义 role`,
+            `<code>${mainPrefix}ds role update &lt;name&gt;</code> - 回复一条消息，覆盖自定义 role`,
+            `<code>${mainPrefix}ds role del &lt;name&gt;</code> - 删除自定义 role`,
+            `<code>${mainPrefix}ds role show &lt;name&gt;</code> - 查看 role 内容`,
+            `<code>${mainPrefix}ds role reset text|vision</code> - 路由 role 重置为 default`,
             `<code>${mainPrefix}ds status</code> - 查看当前配置`,
           ],
         },
@@ -979,6 +1144,10 @@ class DsPlugin extends Plugin {
       await this.handleKey(msg, payload);
       return;
     }
+    if (lowerFirst === "role") {
+      await this.handleRole(msg, payload);
+      return;
+    }
     if (lowerFirst === "model" && lowerSecond === "set") {
       await this.handleModelSet(msg, payload);
       return;
@@ -1011,6 +1180,7 @@ class DsPlugin extends Plugin {
       const provider = getRouteProvider(route, config[route].provider) || getDefaultRouteProvider(route);
       const providerConfig = config.providers[provider.id];
       const key = config.keys[provider.keyProviderId];
+      const role = resolveRoleForRoute(config, route);
       lines.push(`${route === "text" ? "📝" : "🖼️"} <b>${routeLabel(route)}</b>`);
       lines.push(`• Provider: <code>${escapeHtml(provider.displayName)}</code> (<code>${escapeHtml(provider.id)}</code>)`);
       if (providerConfig.models?.length) {
@@ -1019,18 +1189,15 @@ class DsPlugin extends Plugin {
       } else {
         lines.push(`• Model: <code>${escapeHtml(providerConfig.model || provider.model || "(未设置)")}</code>`);
       }
+      lines.push(`• Role: <code>${escapeHtml(role.name)}</code>`);
+      lines.push(`• Role Preview: <code>${escapeHtml(truncateForTelegram(truncatePreview(role.prompt, 120)))}</code>`);
       lines.push(`• API Key: <code>${escapeHtml(maskApiKey(key))}</code>`);
       lines.push(key ? "• 状态: 已就绪" : "• 状态: 未配置 Key");
       lines.push("");
     }
 
-    lines.push(
-      `📝 <b>System Prompt</b>: ${
-        config.systemPrompt
-          ? `<code>${escapeHtml(truncateForTelegram(config.systemPrompt))}</code>`
-          : "未设置"
-      }`,
-    );
+    lines.push(`📦 Built-in Roles: <code>${String(Object.keys(config.roles.builtin).length)}</code>`);
+    lines.push(`🗂️ Custom Roles: <code>${String(Object.keys(config.roles.custom).length)}</code>`);
 
     await safeEditMessage(msg, lines.join("\n"), "html");
   }
@@ -1054,6 +1221,255 @@ class DsPlugin extends Plugin {
     await safeEditMessage(
       msg,
       `✅ Provider <code>${escapeHtml(providerId)}</code> 的 API Key 已更新：<code>${escapeHtml(maskApiKey(apiKey))}</code>`,
+      "html",
+    );
+  }
+
+  private async handleRole(msg: Api.Message, payload: string): Promise<void> {
+    const parts = payload.split(/\s+/).filter(Boolean);
+    const subcommand = parts[1]?.toLowerCase() || "list";
+
+    if (subcommand === "list" || subcommand === "ls") {
+      await this.handleRoleList(msg);
+      return;
+    }
+    if (subcommand === "show") {
+      await this.handleRoleShow(msg, parts[2] || "");
+      return;
+    }
+    if (subcommand === "use") {
+      await this.handleRoleUse(msg, parts[2] || "", parts[3] || "");
+      return;
+    }
+    if (subcommand === "add") {
+      await this.handleRoleAdd(msg, parts[2] || "");
+      return;
+    }
+    if (subcommand === "update") {
+      await this.handleRoleUpdate(msg, parts[2] || "");
+      return;
+    }
+    if (subcommand === "del" || subcommand === "delete" || subcommand === "rm") {
+      await this.handleRoleDelete(msg, parts[2] || "");
+      return;
+    }
+    if (subcommand === "reset") {
+      await this.handleRoleReset(msg, parts[2] || "");
+      return;
+    }
+
+    await safeEditMessage(
+      msg,
+      `未知 role 子命令：<code>${escapeHtml(subcommand)}</code>\n` +
+        `用法：<code>${escapeHtml(mainPrefix)}ds role list</code> / <code>${escapeHtml(mainPrefix)}ds role use text|vision &lt;name&gt;</code>`,
+      "html",
+    );
+  }
+
+  private async handleRoleList(msg: Api.Message): Promise<void> {
+    const config = await this.configStore.get();
+    const lines = ["🤖 <b>DS System Roles</b>", ""];
+
+    const builtinNames = Object.keys(config.roles.builtin).sort();
+    const customNames = Object.keys(config.roles.custom).sort();
+
+    lines.push("📦 <b>Built-in</b>");
+    if (builtinNames.length) {
+      for (const name of builtinNames) {
+        const tags = (["text", "vision"] as const)
+          .filter((route) => config.activeRoles[route] === name)
+          .map((route) => routeShortLabel(route));
+        const prompt = config.roles.builtin[name] || "";
+        lines.push(
+          `• <code>${escapeHtml(name)}</code>${tags.length ? ` [${tags.join(", ")}]` : ""} - ${escapeHtml(truncatePreview(prompt, 60))}`,
+        );
+      }
+    } else {
+      lines.push("• (无)");
+    }
+
+    lines.push("");
+    lines.push("🗂️ <b>Custom</b>");
+    if (customNames.length) {
+      for (const name of customNames) {
+        const tags = (["text", "vision"] as const)
+          .filter((route) => config.activeRoles[route] === name)
+          .map((route) => routeShortLabel(route));
+        const prompt = config.roles.custom[name] || "";
+        lines.push(
+          `• <code>${escapeHtml(name)}</code>${tags.length ? ` [${tags.join(", ")}]` : ""} - ${escapeHtml(truncatePreview(prompt, 60))}`,
+        );
+      }
+    } else {
+      lines.push("• (无)");
+    }
+
+    await safeEditMessage(msg, lines.join("\n"), "html");
+  }
+
+  private async handleRoleShow(msg: Api.Message, rawRoleName: string): Promise<void> {
+    const roleName = normalizeRoleName(rawRoleName);
+    const config = await this.configStore.get();
+    const prompt = getRolePrompt(config, roleName);
+
+    if (!roleName || !prompt) {
+      await safeEditMessage(
+        msg,
+        `用法：<code>${escapeHtml(mainPrefix)}ds role show &lt;name&gt;</code>\n未找到该 role。`,
+        "html",
+      );
+      return;
+    }
+
+    const source = config.roles.custom[roleName] ? "custom" : "builtin";
+    await safeEditMessage(
+      msg,
+      `🤖 <b>Role: ${escapeHtml(roleName)}</b>\n` +
+        `来源: <code>${source}</code>\n\n<blockquote expandable>${escapeHtml(prompt)}</blockquote>`,
+      "html",
+    );
+  }
+
+  private async handleRoleUse(
+    msg: Api.Message,
+    rawRoute: string,
+    rawRoleName: string,
+  ): Promise<void> {
+    const route = rawRoute === "text" || rawRoute === "vision" ? rawRoute : null;
+    const roleName = normalizeRoleName(rawRoleName);
+    const config = await this.configStore.get();
+
+    if (!route || !roleName || !hasRole(config, roleName)) {
+      await safeEditMessage(
+        msg,
+        `用法：<code>${escapeHtml(mainPrefix)}ds role use text|vision &lt;name&gt;</code>`,
+        "html",
+      );
+      return;
+    }
+
+    await this.configStore.setActiveRole(route, roleName);
+    await safeEditMessage(
+      msg,
+      `✅ ${routeLabel(route)} 已切换到 role <code>${escapeHtml(roleName)}</code>`,
+      "html",
+    );
+  }
+
+  private async readRolePromptFromReply(msg: Api.Message): Promise<string> {
+    const replyMsg = await safeGetReplyMessage(msg);
+    const text = (replyMsg?.message || "").trim();
+    return text;
+  }
+
+  private async handleRoleAdd(msg: Api.Message, rawRoleName: string): Promise<void> {
+    const roleName = normalizeRoleName(rawRoleName);
+    const prompt = await this.readRolePromptFromReply(msg);
+    const config = await this.configStore.get();
+
+    if (!roleName || !prompt) {
+      await safeEditMessage(
+        msg,
+        `用法：回复一条包含 prompt 的消息后执行 <code>${escapeHtml(mainPrefix)}ds role add &lt;name&gt;</code>`,
+        "html",
+      );
+      return;
+    }
+    if (isBuiltinRole(roleName) || config.roles.custom[roleName]) {
+      await safeEditMessage(msg, `❌ role <code>${escapeHtml(roleName)}</code> 已存在。`, "html");
+      return;
+    }
+
+    await this.configStore.setCustomRole(roleName, prompt);
+    await safeEditMessage(
+      msg,
+      `✅ 已创建自定义 role <code>${escapeHtml(roleName)}</code>`,
+      "html",
+    );
+  }
+
+  private async handleRoleUpdate(msg: Api.Message, rawRoleName: string): Promise<void> {
+    const roleName = normalizeRoleName(rawRoleName);
+    const prompt = await this.readRolePromptFromReply(msg);
+    const config = await this.configStore.get();
+
+    if (!roleName || !prompt) {
+      await safeEditMessage(
+        msg,
+        `用法：回复一条包含 prompt 的消息后执行 <code>${escapeHtml(mainPrefix)}ds role update &lt;name&gt;</code>`,
+        "html",
+      );
+      return;
+    }
+    if (isBuiltinRole(roleName)) {
+      await safeEditMessage(msg, "❌ 内置 role 不允许修改。", "html");
+      return;
+    }
+    if (!config.roles.custom[roleName]) {
+      await safeEditMessage(msg, `❌ 自定义 role <code>${escapeHtml(roleName)}</code> 不存在。`, "html");
+      return;
+    }
+
+    await this.configStore.setCustomRole(roleName, prompt);
+    await safeEditMessage(
+      msg,
+      `✅ 已更新自定义 role <code>${escapeHtml(roleName)}</code>`,
+      "html",
+    );
+  }
+
+  private async handleRoleDelete(msg: Api.Message, rawRoleName: string): Promise<void> {
+    const roleName = normalizeRoleName(rawRoleName);
+    const config = await this.configStore.get();
+
+    if (!roleName) {
+      await safeEditMessage(
+        msg,
+        `用法：<code>${escapeHtml(mainPrefix)}ds role del &lt;name&gt;</code>`,
+        "html",
+      );
+      return;
+    }
+    if (isBuiltinRole(roleName)) {
+      await safeEditMessage(msg, "❌ 内置 role 不允许删除。", "html");
+      return;
+    }
+    if (!config.roles.custom[roleName]) {
+      await safeEditMessage(msg, `❌ 自定义 role <code>${escapeHtml(roleName)}</code> 不存在。`, "html");
+      return;
+    }
+    if (config.activeRoles.text === roleName || config.activeRoles.vision === roleName) {
+      await safeEditMessage(
+        msg,
+        `❌ role <code>${escapeHtml(roleName)}</code> 正在被使用，请先切换对应路由。`,
+        "html",
+      );
+      return;
+    }
+
+    await this.configStore.deleteCustomRole(roleName);
+    await safeEditMessage(
+      msg,
+      `✅ 已删除自定义 role <code>${escapeHtml(roleName)}</code>`,
+      "html",
+    );
+  }
+
+  private async handleRoleReset(msg: Api.Message, rawRoute: string): Promise<void> {
+    const route = rawRoute === "text" || rawRoute === "vision" ? rawRoute : null;
+    if (!route) {
+      await safeEditMessage(
+        msg,
+        `用法：<code>${escapeHtml(mainPrefix)}ds role reset text|vision</code>`,
+        "html",
+      );
+      return;
+    }
+
+    await this.configStore.resetActiveRole(route);
+    await safeEditMessage(
+      msg,
+      `✅ ${routeLabel(route)} role 已重置为 <code>${DEFAULT_ROLE_NAME}</code>`,
       "html",
     );
   }
