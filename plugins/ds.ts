@@ -898,8 +898,12 @@ function getProviderExtraBody(
   providerId: ProviderId,
   thinkEnabled: boolean,
 ): Record<string, unknown> | undefined {
-  if (thinkEnabled && providerId === "kimi") {
-    return { thinking: { type: "enabled" } };
+  if (providerId === "kimi") {
+    return {
+      thinking: {
+        type: thinkEnabled ? "enabled" : "disabled",
+      },
+    };
   }
   return undefined;
 }
