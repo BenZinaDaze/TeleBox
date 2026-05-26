@@ -81,12 +81,14 @@ type AskContext =
       route: "text";
       question: string;
       repliedText?: string;
+      thinkEnabled: boolean;
     }
   | {
       route: "vision";
       question: string;
       caption: string;
       image: PreparedImage;
+      thinkEnabled: boolean;
     };
 
 type RouteSelection = {
@@ -813,9 +815,30 @@ async function prepareReplyImage(msg: Api.Message): Promise<PreparedImage | null
   };
 }
 
+function parseAskFlags(payload: string): { payload: string; thinkEnabled: boolean } {
+  const trimmed = payload.trim();
+  if (!trimmed) {
+    return { payload: "", thinkEnabled: false };
+  }
+
+  const parts = trimmed.split(/\s+/);
+  let thinkEnabled = false;
+
+  while (parts[0] === "-t") {
+    thinkEnabled = true;
+    parts.shift();
+  }
+
+  return {
+    payload: parts.join(" ").trim(),
+    thinkEnabled,
+  };
+}
+
 async function resolveAskContext(msg: Api.Message, payload: string): Promise<AskContext> {
+  const parsed = parseAskFlags(payload);
   const replied = await safeGetReplyMessage(msg);
-  const question = takeWithMarker(payload.trim(), MAX_QUESTION_CHARS, "问题");
+  const question = takeWithMarker(parsed.payload, MAX_QUESTION_CHARS, "问题");
 
   if (!replied) {
     if (!question) {
@@ -823,7 +846,7 @@ async function resolveAskContext(msg: Api.Message, payload: string): Promise<Ask
         `❌ 用法错误：请直接提问，或回复一条消息后再发送 <code>${escapeHtml(mainPrefix)}ds</code>。`,
       );
     }
-    return { route: "text", question };
+    return { route: "text", question, thinkEnabled: parsed.thinkEnabled };
   }
 
   if (replied.media) {
@@ -839,6 +862,7 @@ async function resolveAskContext(msg: Api.Message, payload: string): Promise<Ask
       question,
       caption,
       image,
+      thinkEnabled: parsed.thinkEnabled,
     };
   }
 
@@ -855,11 +879,15 @@ async function resolveAskContext(msg: Api.Message, payload: string): Promise<Ask
     route: "text",
     question,
     repliedText,
+    thinkEnabled: parsed.thinkEnabled,
   };
 }
 
-function getProviderExtraBody(providerId: ProviderId): Record<string, unknown> | undefined {
-  if (providerId === "kimi") {
+function getProviderExtraBody(
+  providerId: ProviderId,
+  thinkEnabled: boolean,
+): Record<string, unknown> | undefined {
+  if (thinkEnabled && providerId === "kimi") {
     return { thinking: { type: "enabled" } };
   }
   return undefined;
@@ -1073,7 +1101,9 @@ class DsPlugin extends Plugin {
           heading: "📌 基本用法：",
           lines: [
             `<code>${mainPrefix}ds [问题]</code> - 直接提问`,
+            `<code>${mainPrefix}ds -t [问题]</code> - 显式开启 think 后提问`,
             `<code>${mainPrefix}ds</code> - 回复文本继续对话，或回复单张静态图片做识别`,
+            `<code>${mainPrefix}ds -t</code> - 回复消息时显式开启 think`,
             `<code>${mainPrefix}ds 这是什么</code> - 回复图片并提问`,
           ],
         },
@@ -1565,9 +1595,9 @@ class DsPlugin extends Plugin {
     }
 
     const messages = buildMessages(selection.config, context);
-    const extraBody = getProviderExtraBody(selection.provider.id);
+    const extraBody = getProviderExtraBody(selection.provider.id, context.thinkEnabled);
 
-    const thinkingLabel = `🤖 正在使用 ${selection.provider.displayName} (${selection.model})…`;
+    const thinkingLabel = `🤖 正在使用 ${selection.provider.displayName} (${selection.model})${context.thinkEnabled ? " [think]" : ""}…`;
     if (context.question) {
       await safeEditMessage(msg, `💬 ${escapeHtml(context.question)}\n──────────\n${thinkingLabel}`, "html");
     } else {
