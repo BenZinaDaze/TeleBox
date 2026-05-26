@@ -541,7 +541,7 @@ function renderAnswer(params: {
   const answerText = params.answer.trim();
   const answer = answerText
     ? `${reasoning ? "📝 <b>最终答案</b>\n" : ""}${formatAiOutput(answerText)}`
-    : (reasoning ? "" : formatAiOutput(params.answer));
+    : (reasoning ? "📝 <b>最终答案</b>\n<i>思考中…</i>" : formatAiOutput(params.answer));
   const question = params.question?.trim() || "";
   if (question) {
     return `💬 ${escapeHtml(question)}\n──────────\n${header}\n\n${reasoning}${answer}`;
@@ -898,7 +898,7 @@ function getProviderExtraBody(
   providerId: ProviderId,
   thinkEnabled: boolean,
 ): Record<string, unknown> | undefined {
-  if (providerId === "kimi") {
+  if (providerId === "kimi" || providerId === "deepseek") {
     return {
       thinking: {
         type: thinkEnabled ? "enabled" : "disabled",
