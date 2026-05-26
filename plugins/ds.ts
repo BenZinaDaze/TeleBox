@@ -335,10 +335,11 @@ function normalizeModelList(value: unknown): string[] {
 
 function normalizeRoleName(value?: string | null): string {
   return (value || "")
+    .normalize("NFKC")
     .trim()
     .toLowerCase()
     .replace(/\s+/g, "-")
-    .replace(/[^a-z0-9_-]/g, "");
+    .replace(/[^\p{L}\p{N}_-]/gu, "");
 }
 
 function normalizeRoleCollection(value: unknown): RoleCollection {
