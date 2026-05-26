@@ -11,6 +11,7 @@ import { TelegramFormatter } from "@utils/telegramFormatter";
 import {
   createChatCompletion,
   streamChatCompletion,
+  type OpenAICompatDelta,
 } from "@utils/openAICompat";
 
 type RouteKind = "text" | "vision";
@@ -518,24 +519,34 @@ function normalizeConfig(raw?: unknown): DsConfig {
   };
 }
 
-function formatAiOutput(content: string): string {
+function formatAiOutput(content: string, options?: { collapseSafe?: boolean }): string {
   const body = content.trim() || "(无内容)";
-  return TelegramFormatter.markdownToHtml(truncateForTelegram(body));
+  return TelegramFormatter.markdownToHtml(
+    truncateForTelegram(body),
+    options,
+  );
 }
 
 function renderAnswer(params: {
   providerName: string;
   model: string;
   answer: string;
+  reasoning?: string;
   question?: string;
 }): string {
   const header = `🤖 <b>${escapeHtml(params.providerName)} · ${escapeHtml(params.model)}</b>`;
-  const answer = formatAiOutput(params.answer);
+  const reasoning = params.reasoning?.trim()
+    ? `🧠 <b>思考过程</b>\n<blockquote expandable>${formatAiOutput(params.reasoning, { collapseSafe: true })}</blockquote>\n\n`
+    : "";
+  const answerText = params.answer.trim();
+  const answer = answerText
+    ? `${reasoning ? "📝 <b>最终答案</b>\n" : ""}${formatAiOutput(answerText)}`
+    : (reasoning ? "" : formatAiOutput(params.answer));
   const question = params.question?.trim() || "";
   if (question) {
-    return `💬 ${escapeHtml(question)}\n──────────\n${header}\n${answer}`;
+    return `💬 ${escapeHtml(question)}\n──────────\n${header}\n\n${reasoning}${answer}`;
   }
-  return `${header}\n\n${answer}`;
+  return `${header}\n\n${reasoning}${answer}`;
 }
 
 function renderHelpSections(
@@ -896,6 +907,11 @@ function getProviderExtraBody(
 function extractCompletionContent(response: unknown): string | null {
   const content = (response as Record<string, any>)?.choices?.[0]?.message?.content;
   return typeof content === "string" && content.trim() ? content : null;
+}
+
+function extractCompletionReasoning(response: unknown): string | null {
+  const reasoningContent = (response as Record<string, any>)?.choices?.[0]?.message?.reasoning_content;
+  return typeof reasoningContent === "string" && reasoningContent.trim() ? reasoningContent : null;
 }
 
 class DsConfigStore {
@@ -1604,6 +1620,7 @@ class DsPlugin extends Plugin {
       await safeEditMessage(msg, thinkingLabel);
     }
 
+    let reasoning = "";
     let combined = "";
     let lastEditAt = 0;
     let renderChain = Promise.resolve();
@@ -1616,6 +1633,7 @@ class DsPlugin extends Plugin {
         renderAnswer({
           providerName: selection.provider.displayName,
           model: selection.model,
+          reasoning: context.thinkEnabled ? reasoning : undefined,
           answer: combined,
           question: context.question,
         }),
@@ -1634,8 +1652,13 @@ class DsPlugin extends Plugin {
             extraBody,
             timeout: 120_000,
           },
-          (delta) => {
-            combined += delta;
+          (delta: OpenAICompatDelta) => {
+            if (context.thinkEnabled && delta.reasoningContent) {
+              reasoning += delta.reasoningContent;
+            }
+            if (delta.content) {
+              combined += delta.content;
+            }
             renderChain = renderChain.then(() => flush(false)).catch(() => undefined);
           },
         );
@@ -1649,6 +1672,9 @@ class DsPlugin extends Plugin {
           extraBody,
           timeout: 60_000,
         });
+        if (context.thinkEnabled) {
+          reasoning = extractCompletionReasoning(response) || "";
+        }
         combined = extractCompletionContent(response) || "";
       }
 

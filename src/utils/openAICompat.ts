@@ -16,6 +16,11 @@ type OpenAICompatRequestOptions = {
   timeout?: number;
 };
 
+type OpenAICompatDelta = {
+  content?: string;
+  reasoningContent?: string;
+};
+
 function buildEndpoint(baseURL: string): string {
   return `${baseURL.replace(/\/+$/, "")}/chat/completions`;
 }
@@ -47,7 +52,7 @@ async function createChatCompletion(options: OpenAICompatRequestOptions): Promis
 
 async function streamChatCompletion(
   options: OpenAICompatRequestOptions,
-  onDelta: (text: string) => void,
+  onDelta: (delta: OpenAICompatDelta) => void,
 ): Promise<void> {
   const response = await axios.post(
     buildEndpoint(options.baseURL),
@@ -74,8 +79,17 @@ async function streamChatCompletion(
 
       try {
         const parsed = JSON.parse(payload);
-        const delta = parsed?.choices?.[0]?.delta?.content;
-        if (delta) onDelta(delta);
+        const delta = parsed?.choices?.[0]?.delta;
+        const content = typeof delta?.content === "string" ? delta.content : "";
+        const reasoningContent = typeof delta?.reasoning_content === "string"
+          ? delta.reasoning_content
+          : "";
+        if (content || reasoningContent) {
+          onDelta({
+            content: content || undefined,
+            reasoningContent: reasoningContent || undefined,
+          });
+        }
       } catch {
         // ignore partial JSON chunks
       }
@@ -104,6 +118,7 @@ async function streamChatCompletion(
 export {
   createChatCompletion,
   streamChatCompletion,
+  type OpenAICompatDelta,
   type OpenAICompatMessage,
   type OpenAICompatRequestOptions,
 };
