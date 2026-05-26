@@ -1,7 +1,6 @@
 import { Plugin, type PluginRuntimeContext } from "@utils/pluginBase";
 import { getPrefixes } from "@utils/pluginManager";
 import { getGlobalClient } from "@utils/globalClient";
-import { safeGetMe } from "@utils/authGuards";
 import {
   type ArchiveNormalizationStats,
   ArchiveDB,
@@ -219,22 +218,6 @@ function isAbortError(error: unknown): boolean {
   return typeof error === "string" && /aborted|abort/i.test(error);
 }
 
-async function ensureSelfInvocation(
-  msg: Api.Message,
-  ownerIdCacheRef: { current: string | null }
-): Promise<boolean> {
-  if (msg.out) return true;
-  if (!msg.client) return false;
-
-  if (!ownerIdCacheRef.current) {
-    const me = await safeGetMe(msg.client);
-    ownerIdCacheRef.current = me ? getMarkedPeerId(me) || String(me.id) : "";
-  }
-
-  const senderId = msg.senderId ? String(msg.senderId) : undefined;
-  return Boolean(ownerIdCacheRef.current) && Boolean(senderId) && ownerIdCacheRef.current === senderId;
-}
-
 async function resolveEntityWithFallback(client: TelegramClient, raw: string): Promise<any> {
   const attempts: Array<string | number> = [raw];
   if (/^-?\d+$/.test(raw)) {
@@ -312,12 +295,10 @@ class ArchivePlugin extends Plugin {
   private activeBackfill: ActiveBackfillRuntime | null = null;
   private backfillAbortController: AbortController | null = null;
   private lifecycle: GenerationContext | null = null;
-  private ownerIdCache: { current: string | null } = { current: null };
   private runtimeStats: ArchiveRuntimeStats = createRuntimeStats();
 
   setup(context: PluginRuntimeContext): void {
     this.lifecycle = context.lifecycle;
-    this.ownerIdCache.current = null;
     this.runtimeStats = createRuntimeStats();
     const db = new ArchiveDB();
     db.close();
@@ -330,7 +311,6 @@ class ArchivePlugin extends Plugin {
     this.backfillPromise = null;
     this.activeBackfill = null;
     this.backfillAbortController = null;
-    this.ownerIdCache.current = null;
     this.runtimeStats = createRuntimeStats();
   }
 
@@ -375,11 +355,6 @@ class ArchivePlugin extends Plugin {
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     archive: async (msg) => {
-      if (!(await ensureSelfInvocation(msg, this.ownerIdCache))) {
-        await msg.edit({ text: "❌ 仅 TeleBox 所属账号本人可使用 archive 命令" }).catch(() => undefined);
-        return;
-      }
-
       const parts = String(msg.message || msg.text || "").trim().split(/\s+/).filter(Boolean);
       const subCommand = parts[1]?.toLowerCase() || "help";
 

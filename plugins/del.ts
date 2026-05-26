@@ -58,10 +58,6 @@ async function isSelfMessage(msg: Api.Message): Promise<boolean> {
   }
 }
 
-async function ensureSelfInvocation(msg: Api.Message): Promise<boolean> {
-  return await isSelfMessage(msg);
-}
-
 function getHistoryPeer(msg: Api.Message): any {
   return msg.inputChat ?? msg.peerId ?? msg.chatId;
 }
@@ -176,10 +172,6 @@ class DelPlugin extends Plugin {
 
   cmdHandlers = {
     del: async (msg: Api.Message) => {
-      if (!(await ensureSelfInvocation(msg))) {
-        return;
-      }
-
       const mode = parseDeleteMode(msg);
       if (mode.kind === "single") {
         await deleteSingleMessageFlow(msg);

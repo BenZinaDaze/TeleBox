@@ -6,7 +6,6 @@ import { Api } from "teleproto";
 import { Plugin } from "@utils/pluginBase";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
 import { getPrefixes } from "@utils/pluginManager";
-import { safeGetMe } from "@utils/authGuards";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
 import { TelegramFormatter } from "@utils/telegramFormatter";
 import {
@@ -676,20 +675,6 @@ async function safeEditMessage(
   await msg.edit({ text }).catch(() => undefined);
 }
 
-async function ensureSelfInvocation(msg: Api.Message): Promise<boolean> {
-  if (msg.out) return true;
-  if (!msg.client) return false;
-
-  try {
-    const me = await safeGetMe(msg.client);
-    const ownerId = getComparableId(me?.id);
-    const senderId = getMessageSenderId(msg);
-    return !!ownerId && !!senderId && ownerId === senderId;
-  } catch {
-    return false;
-  }
-}
-
 function getMessageImageMimeType(message: Api.Message): string {
   const documentMime = (message.media as { document?: { mimeType?: unknown } } | undefined)
     ?.document?.mimeType;
@@ -1073,7 +1058,6 @@ class DsPlugin extends Plugin {
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     ds: async (msg) => {
-      if (!(await ensureSelfInvocation(msg))) return;
       await this.handleDs(msg);
     },
   };

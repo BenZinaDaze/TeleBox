@@ -7,7 +7,6 @@ import type { Low } from "lowdb";
 import { JSONFilePreset } from "lowdb/node";
 import { Api } from "teleproto";
 import { CustomFile } from "teleproto/client/uploads.js";
-import { safeGetMe } from "@utils/authGuards";
 import {
   Plugin,
   type PluginRuntimeContext,
@@ -166,20 +165,6 @@ async function safeEditMessage(
     return;
   }
   await msg.edit({ text }).catch(() => undefined);
-}
-
-async function ensureSelfInvocation(msg: Api.Message): Promise<boolean> {
-  if (msg.out) return true;
-  if (!msg.client) return false;
-
-  try {
-    const me = await safeGetMe(msg.client);
-    const ownerId = getComparableId(me?.id);
-    const senderId = getMessageSenderId(msg);
-    return !!ownerId && !!senderId && ownerId === senderId;
-  } catch {
-    return false;
-  }
 }
 
 function abortError(reason?: unknown): Error {
@@ -1096,10 +1081,6 @@ class CodexImagePlugin extends Plugin {
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     img: async (msg) => {
-      if (!(await ensureSelfInvocation(msg))) {
-        return;
-      }
-
       const body = getCommandBody(msg.message || "");
       const args = parseArgs(body);
       const head = (args[0] || "").toLowerCase();
