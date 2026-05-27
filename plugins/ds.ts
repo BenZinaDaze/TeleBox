@@ -102,6 +102,7 @@ type RouteSelection = {
 
 const PLUGIN_NAME = "ds";
 const TELEGRAM_TEXT_LIMIT = 3500;
+const COLLAPSIBLE_ANSWER_THRESHOLD = 200;
 const STREAM_EDIT_INTERVAL_MS = 900;
 const MAX_REFERENCE_BYTES = 8 * 1024 * 1024;
 const TARGET_REFERENCE_BYTES = 4 * 1024 * 1024;
@@ -546,6 +547,14 @@ function formatAiOutput(content: string, options?: { collapseSafe?: boolean }): 
   );
 }
 
+function renderAnswerBody(answer: string, wrapExpandable: boolean): string {
+  if (!answer.trim()) return formatAiOutput(answer);
+  if (!wrapExpandable) {
+    return formatAiOutput(answer);
+  }
+  return `<blockquote expandable>${formatAiOutput(answer, { collapseSafe: true })}</blockquote>`;
+}
+
 function renderAnswer(params: {
   providerName: string;
   model: string;
@@ -558,8 +567,9 @@ function renderAnswer(params: {
     ? `🧠 <b>思考过程</b>\n<blockquote expandable>${formatAiOutput(params.reasoning, { collapseSafe: true })}</blockquote>\n\n`
     : "";
   const answerText = params.answer.trim();
+  const wrapAnswerExpandable = answerText.length >= COLLAPSIBLE_ANSWER_THRESHOLD;
   const answer = answerText
-    ? `${reasoning ? "📝 <b>最终答案</b>\n" : ""}${formatAiOutput(answerText)}`
+    ? `${reasoning ? "📝 <b>最终答案</b>\n" : ""}${renderAnswerBody(answerText, wrapAnswerExpandable)}`
     : (reasoning ? "📝 <b>最终答案</b>\n<i>思考中…</i>" : formatAiOutput(params.answer));
   const question = params.question?.trim() || "";
   if (question) {
