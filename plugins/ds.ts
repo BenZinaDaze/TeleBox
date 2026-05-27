@@ -120,7 +120,7 @@ type DsCliContext = {
 
 const PLUGIN_NAME = "ds";
 const TELEGRAM_TEXT_LIMIT = 3500;
-const COLLAPSIBLE_ANSWER_THRESHOLD = 200;
+const COLLAPSIBLE_ANSWER_THRESHOLD = 50;
 const STREAM_EDIT_INTERVAL_MS = 900;
 const MAX_REFERENCE_BYTES = 8 * 1024 * 1024;
 const TARGET_REFERENCE_BYTES = 4 * 1024 * 1024;
@@ -1184,33 +1184,29 @@ class DsPlugin extends Plugin {
           heading: "📌 基本用法：",
           lines: [
             `<code>${mainPrefix}ds [问题]</code> - 直接提问`,
-            `<code>${mainPrefix}ds -t [问题]</code> - 显式开启 think 后提问`,
+            `<code>${mainPrefix}ds -t [问题]</code> - 本次请求开启 think`,
             `<code>${mainPrefix}ds -r &lt;role&gt; [问题]</code> - 本次请求临时使用指定 role`,
             `<code>${mainPrefix}ds</code> - 回复文本继续对话，或回复单张静态图片做识别`,
-            `<code>${mainPrefix}ds -t</code> - 回复消息时显式开启 think`,
-            `<code>${mainPrefix}ds -r &lt;role&gt;</code> - 回复消息时临时使用指定 role`,
             `<code>${mainPrefix}ds 这是什么</code> - 回复图片并提问`,
           ],
         },
         {
           heading: "⚙️ 配置命令：",
           lines: [
-            `<code>${mainPrefix}ds -txt use &lt;provider&gt;</code> - 配置文本路由`,
-            `<code>${mainPrefix}ds -vis use &lt;provider&gt;</code> - 配置多模态路由`,
-            `<code>${mainPrefix}ds use -txt &lt;provider&gt;</code> - 配置文本路由`,
-            `<code>${mainPrefix}ds use -vis &lt;provider&gt;</code> - 配置多模态路由`,
+            `<code>${mainPrefix}ds use -txt|--text &lt;provider&gt;</code> - 配置文本路由`,
+            `<code>${mainPrefix}ds use -vis|--vision &lt;provider&gt;</code> - 配置多模态路由`,
             `<code>${mainPrefix}ds key &lt;provider&gt; &lt;apiKey&gt;</code> - 设置 API Key`,
             `<code>${mainPrefix}ds model set &lt;provider&gt; &lt;model&gt;</code> - 设置 provider 的单模型`,
             `<code>${mainPrefix}ds models set &lt;provider&gt; &lt;m1,m2,m3&gt;</code> - 设置 provider 的轮询模型池`,
             `<code>${mainPrefix}ds role list</code> - 查看全部 system role`,
-            `<code>${mainPrefix}ds role use -txt|--text &lt;name&gt;</code> - 切换文本路由 role`,
-            `<code>${mainPrefix}ds role use -vis|--vision &lt;name&gt;</code> - 切换多模态路由 role`,
+            `<code>${mainPrefix}ds role use -txt|--text &lt;name&gt;</code> - 切换路由 role（` +
+              `<code>-vis|--vision</code> 同理）`,
             `<code>${mainPrefix}ds role add &lt;name&gt;</code> - 回复一条消息，创建自定义 role`,
             `<code>${mainPrefix}ds role update &lt;name&gt;</code> - 回复一条消息，覆盖自定义 role`,
             `<code>${mainPrefix}ds role del &lt;name&gt;</code> - 删除自定义 role`,
             `<code>${mainPrefix}ds role show &lt;name&gt;</code> - 查看 role 内容`,
-            `<code>${mainPrefix}ds role reset -txt|--text</code> - 文本路由 role 重置为 default`,
-            `<code>${mainPrefix}ds role reset -vis|--vision</code> - 多模态路由 role 重置为 default`,
+            `<code>${mainPrefix}ds role reset -txt|--text</code> - 路由 role 重置为 default（` +
+              `<code>-vis|--vision</code> 同理）`,
             `<code>${mainPrefix}ds status</code> - 查看当前配置`,
           ],
         },
