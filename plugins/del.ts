@@ -1,4 +1,5 @@
 import { Plugin } from "@utils/pluginBase";
+import { parseCommandInput } from "@utils/commandParser";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
 import { safeGetMe } from "@utils/authGuards";
 import { Api } from "teleproto";
@@ -16,8 +17,7 @@ type BulkDeleteMode =
   | { kind: "bulk"; count: number };
 
 function getCommandArgs(msg: Api.Message): string[] {
-  const text = msg.message || msg.text || "";
-  return text.trim().split(/\s+/).slice(1);
+  return parseCommandInput(msg)?.args || [];
 }
 
 function parseDeleteMode(msg: Api.Message): BulkDeleteMode {

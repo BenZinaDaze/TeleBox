@@ -1,20 +1,16 @@
 import { Plugin, type PluginRuntimeContext } from "@utils/pluginBase";
+import { parseCommandInput } from "@utils/commandParser";
 import { getPrefixes } from "@utils/pluginManager";
 import { getGlobalClient } from "@utils/globalClient";
 import {
   type ArchiveNormalizationStats,
   ArchiveDB,
-  type ArchiveSearchParams,
-  type ArchiveSearchRow,
   type ArchiveStats,
   type BackfillTargetRecord,
-  type BackfillTargetStatus,
 } from "@utils/archiveDb";
 import {
   buildArchiveInput,
   collectChatIdCandidates,
-  getDateNumber,
-  normalizeId,
   resolveChatContext,
   toCanonicalChatId,
   type ArchiveChatType,
@@ -27,8 +23,6 @@ const prefixes = getPrefixes();
 const mainPrefix = prefixes[0] || ".";
 const pluginName = "archive";
 const commandName = `${mainPrefix}${pluginName}`;
-const MAX_RESULT_COUNT = 20;
-const MAX_CHUNK_LENGTH = 3500;
 const BACKFILL_LIST_PAGE_SIZE = 10;
 const BACKFILL_BATCH_SIZE = 100;
 const BACKFILL_BATCH_PAUSE_MS = 2000;
@@ -92,15 +86,6 @@ function renderHelpSections(
   return blocks.join("\n");
 }
 
-type CommandFilters = {
-  keyword?: string;
-  chat?: string;
-  user?: string;
-  from?: string;
-  to?: string;
-  limit?: number;
-};
-
 function htmlEscape(text: string): string {
   return text
     .replace(/&/g, "&amp;")
@@ -130,19 +115,6 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
-function compact(text: string, limit = 180): string {
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}...`;
-}
-
-function buildExpandableBlockquote(lines: string[]): string {
-  return `<blockquote expandable>${lines.join("\n\n")}</blockquote>`;
-}
-
-function canUseFtsKeyword(keyword: string): boolean {
-  return /^[\p{L}\p{N}\s_-]+$/u.test(keyword);
-}
-
 function getFloodWaitMs(error: unknown): number | null {
   const message = extractErrorMessage(error);
   const match = /FLOOD(?:_PREMIUM)?_WAIT_(\d+)/.exec(message) || /A wait of (\d+) seconds/i.exec(message);
@@ -152,51 +124,6 @@ function getFloodWaitMs(error: unknown): number | null {
   return (seconds + 1) * 1000;
 }
 
-function parseDateInput(value?: string, endOfDay = false): number | undefined {
-  if (!value) return undefined;
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
-  if (!match) return undefined;
-  const [, y, m, d] = match;
-  const suffix = endOfDay ? "T23:59:59.999+08:00" : "T00:00:00.000+08:00";
-  const parsed = Date.parse(`${y}-${m}-${d}${suffix}`);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function parseCommandFilters(args: string[]): CommandFilters {
-  const filters: CommandFilters = {};
-  const keywordParts: string[] = [];
-
-  for (const arg of args) {
-    if (arg.startsWith("chat=")) {
-      filters.chat = arg.slice("chat=".length);
-      continue;
-    }
-    if (arg.startsWith("user=")) {
-      filters.user = arg.slice("user=".length);
-      continue;
-    }
-    if (arg.startsWith("from=")) {
-      filters.from = arg.slice("from=".length);
-      continue;
-    }
-    if (arg.startsWith("to=")) {
-      filters.to = arg.slice("to=".length);
-      continue;
-    }
-    if (arg.startsWith("limit=")) {
-      const parsed = parseInt(arg.slice("limit=".length), 10);
-      if (Number.isFinite(parsed) && parsed > 0) {
-        filters.limit = Math.min(parsed, MAX_RESULT_COUNT);
-      }
-      continue;
-    }
-    keywordParts.push(arg);
-  }
-
-  const keyword = keywordParts.join(" ").trim();
-  if (keyword) filters.keyword = keyword;
-  return filters;
-}
 
 function abortError(reason?: unknown): Error {
   if (reason instanceof Error) return reason;
@@ -261,34 +188,6 @@ function getChatTypeFromEntity(entity: unknown): ArchiveChatType | undefined {
   return undefined;
 }
 
-async function resolveChatIdFilter(client: TelegramClient, input?: string): Promise<string | undefined> {
-  if (!input) return undefined;
-  if (/^-?\d+$/.test(input)) return input;
-  let entity: any;
-  try {
-    entity = await resolveEntityWithFallback(client, input);
-  } catch (error) {
-    throw new Error(
-      `无法解析聊天目标: ${input}\n请使用 @username 或数字 chatId\n原因: ${extractErrorMessage(error)}`
-    );
-  }
-  return getMarkedPeerId(entity);
-}
-
-async function resolveUserIdFilter(client: TelegramClient, input?: string): Promise<string | undefined> {
-  if (!input) return undefined;
-  if (/^-?\d+$/.test(input)) return input;
-  let entity: any;
-  try {
-    entity = await resolveEntityWithFallback(client, input);
-  } catch (error) {
-    throw new Error(
-      `无法解析用户目标: ${input}\n请使用 @username 或数字 userId\n原因: ${extractErrorMessage(error)}`
-    );
-  }
-  return getMarkedPeerId(entity);
-}
-
 class ArchivePlugin extends Plugin {
   name = pluginName;
   private backfillPromise: Promise<void> | null = null;
@@ -339,14 +238,6 @@ class ArchivePlugin extends Plugin {
           `<code>${commandName} bl list</code> - 查看黑名单`,
         ],
       },
-      {
-        heading: "🔎 检索命令：",
-        lines: [
-          `<code>${commandName} search 关键词 [chat=@xxx] [user=@xxx] [from=2026-05-01] [to=2026-05-22] [limit=10]</code>`,
-          `<code>${commandName} chat @chat或chatId [关键词] [from=YYYY-MM-DD] [to=YYYY-MM-DD] [limit=10]</code>`,
-          `<code>${commandName} user @user或userId [关键词] [chat=@chat] [from=YYYY-MM-DD] [to=YYYY-MM-DD] [limit=10]</code>`,
-        ],
-      },
     ],
   );
 
@@ -355,8 +246,9 @@ class ArchivePlugin extends Plugin {
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     archive: async (msg) => {
-      const parts = String(msg.message || msg.text || "").trim().split(/\s+/).filter(Boolean);
-      const subCommand = parts[1]?.toLowerCase() || "help";
+      const parsed = parseCommandInput(msg);
+      const args = parsed?.args || [];
+      const subCommand = args[0]?.toLowerCase() || "help";
 
       if (subCommand === "help") {
         await msg.edit({ text: this.description, parseMode: "html", linkPreview: false });
@@ -371,26 +263,13 @@ class ArchivePlugin extends Plugin {
         return;
       }
       if (subCommand === "backfill") {
-        await this.handleBackfill(msg, parts.slice(2));
+        await this.handleBackfill(msg, args.slice(1));
         return;
       }
       if (subCommand === "bl") {
-        await this.handleBlacklist(msg, parts.slice(2));
+        await this.handleBlacklist(msg, args.slice(1));
         return;
       }
-      if (subCommand === "search") {
-        await this.handleSearch(msg, parts.slice(2));
-        return;
-      }
-      if (subCommand === "chat") {
-        await this.handleChatSearch(msg, parts.slice(2));
-        return;
-      }
-      if (subCommand === "user") {
-        await this.handleUserSearch(msg, parts.slice(2));
-        return;
-      }
-
       await msg.edit({ text: this.description, parseMode: "html", linkPreview: false });
     },
   };
@@ -1107,145 +986,6 @@ class ArchivePlugin extends Plugin {
         parseMode: "html",
         linkPreview: false,
       });
-    } finally {
-      db.close();
-    }
-  }
-
-  private async handleSearch(msg: Api.Message, args: string[]): Promise<void> {
-    const client = await getGlobalClient();
-    if (!client) {
-      await msg.edit({ text: "❌ Telegram 客户端未初始化" });
-      return;
-    }
-
-    const filters = parseCommandFilters(args);
-    await this.runSearch(msg, client, filters, "search");
-  }
-
-  private async handleChatSearch(msg: Api.Message, args: string[]): Promise<void> {
-    const client = await getGlobalClient();
-    if (!client) {
-      await msg.edit({ text: "❌ Telegram 客户端未初始化" });
-      return;
-    }
-    const [chatTarget, ...rest] = args;
-    if (!chatTarget) {
-      await msg.edit({ text: `用法: <code>${commandName} chat @chat或chatId [关键词] [from=YYYY-MM-DD] [to=YYYY-MM-DD] [limit=10]</code>`, parseMode: "html" });
-      return;
-    }
-    const filters = parseCommandFilters(rest);
-    filters.chat = chatTarget;
-    await this.runSearch(msg, client, filters, "chat");
-  }
-
-  private async handleUserSearch(msg: Api.Message, args: string[]): Promise<void> {
-    const client = await getGlobalClient();
-    if (!client) {
-      await msg.edit({ text: "❌ Telegram 客户端未初始化" });
-      return;
-    }
-    const [userTarget, ...rest] = args;
-    if (!userTarget) {
-      await msg.edit({ text: `用法: <code>${commandName} user @user或userId [关键词] [chat=@chat] [from=YYYY-MM-DD] [to=YYYY-MM-DD] [limit=10]</code>`, parseMode: "html" });
-      return;
-    }
-    const filters = parseCommandFilters(rest);
-    filters.user = userTarget;
-    await this.runSearch(msg, client, filters, "user");
-  }
-
-  private async runSearch(
-    msg: Api.Message,
-    client: TelegramClient,
-    filters: CommandFilters,
-    mode: "search" | "chat" | "user"
-  ): Promise<void> {
-    const db = new ArchiveDB();
-    try {
-      const limit = Math.min(Math.max(filters.limit || 10, 1), MAX_RESULT_COUNT);
-      const chatId = await resolveChatIdFilter(client, filters.chat);
-      const senderId = await resolveUserIdFilter(client, filters.user);
-      const fromTs = parseDateInput(filters.from, false);
-      const toTs = parseDateInput(filters.to, true);
-
-      if (filters.from && !fromTs) {
-        await msg.edit({ text: "❌ `from=` 日期格式错误，应为 YYYY-MM-DD", parseMode: "markdown" }).catch(() => undefined);
-        return;
-      }
-      if (filters.to && !toTs) {
-        await msg.edit({ text: "❌ `to=` 日期格式错误，应为 YYYY-MM-DD", parseMode: "markdown" }).catch(() => undefined);
-        return;
-      }
-      if (mode === "search" && !filters.keyword) {
-        await msg.edit({
-          text: `用法: <code>${commandName} search 关键词 [chat=@xxx] [user=@xxx] [from=YYYY-MM-DD] [to=YYYY-MM-DD] [limit=10]</code>`,
-          parseMode: "html",
-        });
-        return;
-      }
-
-      const rows = db.searchMessages({
-        keyword: filters.keyword,
-        chatId,
-        senderId,
-        fromTs,
-        toTs,
-        limit,
-      });
-
-      if (rows.length === 0) {
-        await msg.edit({ text: "🔍 未找到匹配消息" });
-        return;
-      }
-
-      const header = [
-        "🔎 <b>Archive 查询结果</b>",
-        `<b>结果数:</b> ${rows.length}`,
-      ];
-      if (filters.keyword) header.push(`<b>关键词:</b> ${htmlEscape(filters.keyword)}`);
-      if (filters.chat) header.push(`<b>聊天过滤:</b> ${htmlEscape(filters.chat)}`);
-      if (filters.user) header.push(`<b>用户过滤:</b> ${htmlEscape(filters.user)}`);
-      if (filters.from) header.push(`<b>开始:</b> ${htmlEscape(filters.from)}`);
-      if (filters.to) header.push(`<b>结束:</b> ${htmlEscape(filters.to)}`);
-
-      const lines = rows.map((row, index) => {
-        const summary = compact(row.rawText || row.caption || `[${row.messageType}]`);
-        const prefix = `${index + 1}. <code>${htmlEscape(formatTime(row.date))}</code> <b>${htmlEscape(
-          row.chatId
-        )}</b> · ${htmlEscape(row.senderId || "unknown")}`;
-        if (row.link) {
-          return `${prefix}\n<a href="${htmlEscape(row.link)}">${htmlEscape(summary)}</a>`;
-        }
-        return `${prefix}\n${htmlEscape(summary)}`;
-      });
-
-      const chunks: string[] = [];
-      let currentLines: string[] = [];
-      let currentHeader = header.join("\n");
-      for (const line of lines) {
-        const candidateLines = [...currentLines, line];
-        const candidate = `${currentHeader}\n\n${buildExpandableBlockquote(candidateLines)}`;
-        if (candidate.length > MAX_CHUNK_LENGTH && currentLines.length > 0) {
-          chunks.push(`${currentHeader}\n\n${buildExpandableBlockquote(currentLines)}`);
-          currentHeader = "🔎 <b>Archive 查询结果</b>（续）";
-          currentLines = [line];
-        } else {
-          currentLines = candidateLines;
-        }
-      }
-      if (currentLines.length > 0) {
-        chunks.push(`${currentHeader}\n\n${buildExpandableBlockquote(currentLines)}`);
-      }
-
-      await msg.edit({ text: chunks[0], parseMode: "html", linkPreview: false });
-      for (let i = 1; i < chunks.length; i += 1) {
-        await client.sendMessage(msg.peerId, {
-          message: chunks[i],
-          parseMode: "html",
-          linkPreview: false,
-        });
-      }
     } finally {
       db.close();
     }

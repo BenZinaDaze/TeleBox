@@ -5,6 +5,7 @@ import { JSONFilePreset } from "lowdb/node";
 import { Api } from "teleproto";
 import { Plugin } from "@utils/pluginBase";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
+import { parseCliOptions, parseCommandInput } from "@utils/commandParser";
 import { getPrefixes } from "@utils/pluginManager";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
 import { TelegramFormatter } from "@utils/telegramFormatter";
@@ -281,19 +282,6 @@ function getMessageSenderId(msg: Api.Message): string | undefined {
     getComparableId((msg as Api.Message & { senderId?: unknown }).senderId) ||
     getComparableId((msg as Api.Message & { fromId?: unknown }).fromId)
   );
-}
-
-function getMatchedPrefix(text: string): string {
-  return prefixes.find((prefix) => text.startsWith(prefix)) || text[0] || mainPrefix;
-}
-
-function getCommandPayload(text: string): string {
-  const prefix = getMatchedPrefix(text);
-  const rest = text.slice(prefix.length).trim();
-  if (!rest) return "";
-  const firstSpace = rest.indexOf(" ");
-  if (firstSpace === -1) return "";
-  return rest.slice(firstSpace + 1).trim();
 }
 
 function truncateForTelegram(text: string): string {
@@ -855,30 +843,12 @@ async function prepareReplyImage(msg: Api.Message): Promise<PreparedImage | null
   };
 }
 
-function parseAskFlags(payload: string): { payload: string; thinkEnabled: boolean } {
-  const trimmed = payload.trim();
-  if (!trimmed) {
-    return { payload: "", thinkEnabled: false };
-  }
-
-  const parts = trimmed.split(/\s+/);
-  let thinkEnabled = false;
-
-  while (parts[0] === "-t") {
-    thinkEnabled = true;
-    parts.shift();
-  }
-
-  return {
-    payload: parts.join(" ").trim(),
-    thinkEnabled,
-  };
-}
-
-async function resolveAskContext(msg: Api.Message, payload: string): Promise<AskContext> {
-  const parsed = parseAskFlags(payload);
+async function resolveAskContext(msg: Api.Message, args: string[]): Promise<AskContext> {
+  const parsed = parseCliOptions(args, [
+    { name: "think", aliases: ["-t", "--think"], kind: "boolean" },
+  ]);
   const replied = await safeGetReplyMessage(msg);
-  const question = takeWithMarker(parsed.payload, MAX_QUESTION_CHARS, "问题");
+  const question = takeWithMarker(parsed.positionals.join(" "), MAX_QUESTION_CHARS, "问题");
 
   if (!replied) {
     if (!question) {
@@ -886,7 +856,11 @@ async function resolveAskContext(msg: Api.Message, payload: string): Promise<Ask
         `❌ 用法错误：请直接提问，或回复一条消息后再发送 <code>${escapeHtml(mainPrefix)}ds</code>。`,
       );
     }
-    return { route: "text", question, thinkEnabled: parsed.thinkEnabled };
+    return {
+      route: "text",
+      question,
+      thinkEnabled: parsed.options.think === true,
+    };
   }
 
   if (replied.media) {
@@ -902,7 +876,7 @@ async function resolveAskContext(msg: Api.Message, payload: string): Promise<Ask
       question,
       caption,
       image,
-      thinkEnabled: parsed.thinkEnabled,
+      thinkEnabled: parsed.options.think === true,
     };
   }
 
@@ -919,7 +893,7 @@ async function resolveAskContext(msg: Api.Message, payload: string): Promise<Ask
     route: "text",
     question,
     repliedText,
-    thinkEnabled: parsed.thinkEnabled,
+    thinkEnabled: parsed.options.think === true,
   };
 }
 
@@ -1190,8 +1164,10 @@ class DsPlugin extends Plugin {
   }
 
   private async handleDs(msg: Api.Message): Promise<void> {
-    const payload = getCommandPayload(msg.message || "");
-    const [first = "", second = "", third = ""] = payload.split(/\s+/);
+    const parsed = parseCommandInput(msg);
+    const payload = parsed?.body || "";
+    const args = parsed?.args || [];
+    const [first = "", second = "", third = ""] = args;
     const lowerFirst = first.toLowerCase();
     const lowerSecond = second.toLowerCase();
     const lowerThird = third.toLowerCase();
@@ -1205,19 +1181,19 @@ class DsPlugin extends Plugin {
       return;
     }
     if (lowerFirst === "key") {
-      await this.handleKey(msg, payload);
+      await this.handleKey(msg);
       return;
     }
     if (lowerFirst === "role") {
-      await this.handleRole(msg, payload);
+      await this.handleRole(msg);
       return;
     }
     if (lowerFirst === "model" && lowerSecond === "set") {
-      await this.handleModelSet(msg, payload);
+      await this.handleModelSet(msg);
       return;
     }
     if (lowerFirst === "models" && lowerSecond === "set") {
-      await this.handleModelsSet(msg, payload);
+      await this.handleModelsSet(msg);
       return;
     }
     if (lowerFirst === "text" && lowerSecond === "use") {
@@ -1229,7 +1205,7 @@ class DsPlugin extends Plugin {
       return;
     }
 
-    await this.handleAsk(msg, payload);
+    await this.handleAsk(msg);
   }
 
   private async handleHelp(msg: Api.Message): Promise<void> {
@@ -1266,10 +1242,11 @@ class DsPlugin extends Plugin {
     await safeEditMessage(msg, lines.join("\n"), "html");
   }
 
-  private async handleKey(msg: Api.Message, payload: string): Promise<void> {
-    const parts = payload.split(/\s+/);
-    const providerId = normalizeProviderId(parts[1]);
-    const apiKey = payload.replace(/^key\s+\S+\s+/i, "").trim();
+  private async handleKey(msg: Api.Message): Promise<void> {
+    const parsed = parseCommandInput(msg);
+    const args = parsed?.args || [];
+    const providerId = normalizeProviderId(args[1]);
+    const apiKey = args.slice(2).join(" ").trim();
 
     if (!providerId || !apiKey) {
       await safeEditMessage(
@@ -1289,8 +1266,9 @@ class DsPlugin extends Plugin {
     );
   }
 
-  private async handleRole(msg: Api.Message, payload: string): Promise<void> {
-    const parts = payload.split(/\s+/).filter(Boolean);
+  private async handleRole(msg: Api.Message): Promise<void> {
+    const parsed = parseCommandInput(msg);
+    const parts = parsed?.args || [];
     const subcommand = parts[1]?.toLowerCase() || "list";
 
     if (subcommand === "list" || subcommand === "ls") {
@@ -1538,10 +1516,11 @@ class DsPlugin extends Plugin {
     );
   }
 
-  private async handleModelSet(msg: Api.Message, payload: string): Promise<void> {
-    const parts = payload.split(/\s+/);
-    const providerId = normalizeProviderId(parts[2]);
-    const model = payload.replace(/^model\s+set\s+\S+\s+/i, "").trim();
+  private async handleModelSet(msg: Api.Message): Promise<void> {
+    const parsed = parseCommandInput(msg);
+    const args = parsed?.args || [];
+    const providerId = normalizeProviderId(args[2]);
+    const model = args.slice(3).join(" ").trim();
 
     if (!providerId || !model) {
       await safeEditMessage(
@@ -1560,10 +1539,11 @@ class DsPlugin extends Plugin {
     );
   }
 
-  private async handleModelsSet(msg: Api.Message, payload: string): Promise<void> {
-    const parts = payload.split(/\s+/);
-    const providerId = normalizeProviderId(parts[2]);
-    const rawModels = payload.replace(/^models\s+set\s+\S+\s+/i, "").trim();
+  private async handleModelsSet(msg: Api.Message): Promise<void> {
+    const parsed = parseCommandInput(msg);
+    const args = parsed?.args || [];
+    const providerId = normalizeProviderId(args[2]);
+    const rawModels = args.slice(3).join(" ").trim();
     const models = normalizeModelList(rawModels);
 
     if (!providerId || !models.length) {
@@ -1613,12 +1593,14 @@ class DsPlugin extends Plugin {
     await safeEditMessage(msg, lines.join("\n"), "html");
   }
 
-  private async handleAsk(msg: Api.Message, payload: string): Promise<void> {
+  private async handleAsk(msg: Api.Message): Promise<void> {
     await safeEditMessage(msg, "🤖 正在整理上下文…");
 
     let context: AskContext;
     try {
-      context = await resolveAskContext(msg, payload);
+      const parsed = parseCommandInput(msg);
+      const args = parsed?.args || [];
+      context = await resolveAskContext(msg, args);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await safeEditMessage(msg, message, message.includes("<code>") ? "html" : undefined);

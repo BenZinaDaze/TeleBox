@@ -11,6 +11,7 @@ import {
   Plugin,
   type PluginRuntimeContext,
 } from "@utils/pluginBase";
+import { parseCliOptions, parseCommandInput, tokenizeCliArgs } from "@utils/commandParser";
 import type { GenerationContext } from "@utils/generationContext";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
@@ -266,39 +267,23 @@ async function resolveAuth(
   return { token: "", source: "missing" };
 }
 
-function parseArgs(text: string): string[] {
-  return text.trim().split(/\s+/).filter(Boolean);
-}
-
 function parseGenerateOptions(rawPrompt: string): {
   prompt: string;
   options: GenerateOptions;
 } {
-  const parts = rawPrompt.split(/\s+/).filter(Boolean);
+  const parts = tokenizeCliArgs(rawPrompt);
   const options: GenerateOptions = {
     transparentBackground: false,
   };
-  const promptParts: string[] = [];
-
-  for (const part of parts) {
-    if (part === "-t") {
-      options.transparentBackground = true;
-      continue;
-    }
-    promptParts.push(part);
-  }
+  const parsed = parseCliOptions(parts, [
+    { name: "transparentBackground", aliases: ["-t", "--transparent"], kind: "boolean" },
+  ]);
+  options.transparentBackground = parsed.options.transparentBackground === true;
 
   return {
-    prompt: promptParts.join(" ").trim(),
+    prompt: parsed.positionals.join(" ").trim(),
     options,
   };
-}
-
-function getCommandBody(text: string): string {
-  const trimmed = text.trim();
-  const firstSpace = trimmed.indexOf(" ");
-  if (firstSpace === -1) return "";
-  return trimmed.slice(firstSpace + 1).trim();
 }
 
 function getAuthSourceLabel(source: AuthSource): string {
@@ -1081,8 +1066,9 @@ class CodexImagePlugin extends Plugin {
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     img: async (msg) => {
-      const body = getCommandBody(msg.message || "");
-      const args = parseArgs(body);
+      const parsed = parseCommandInput(msg);
+      const body = parsed?.body || "";
+      const args = parsed?.args || [];
       const head = (args[0] || "").toLowerCase();
 
       if (head === "auth") {
