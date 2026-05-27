@@ -5,7 +5,12 @@ import { JSONFilePreset } from "lowdb/node";
 import { Api } from "teleproto";
 import { Plugin } from "@utils/pluginBase";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
-import { parseCliOptions, parseCommandInput } from "@utils/commandParser";
+import {
+  parseCliOptions,
+  parseCommandInput,
+  type ParsedCliOptions,
+  type ParsedCommandInput,
+} from "@utils/commandParser";
 import { getPrefixes } from "@utils/pluginManager";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
 import { TelegramFormatter } from "@utils/telegramFormatter";
@@ -84,6 +89,7 @@ type AskContext =
       question: string;
       repliedText?: string;
       thinkEnabled: boolean;
+      roleOverrideName?: string;
     }
   | {
       route: "vision";
@@ -91,6 +97,7 @@ type AskContext =
       caption: string;
       image: PreparedImage;
       thinkEnabled: boolean;
+      roleOverrideName?: string;
     };
 
 type RouteSelection = {
@@ -99,6 +106,16 @@ type RouteSelection = {
   model: string;
   pool: string[];
   selectedIndex: number;
+};
+
+type DsCliContext = {
+  command: ParsedCommandInput | null;
+  cli: ParsedCliOptions;
+  route: RouteKind | null;
+  mainCommand: string;
+  subCommand: string;
+  args: string[];
+  hasRouteConflict: boolean;
 };
 
 const PLUGIN_NAME = "ds";
@@ -393,6 +410,21 @@ function resolveRoleForRoute(config: DsConfig, route: RouteKind): { name: string
   };
 }
 
+function resolveRoleForAsk(
+  config: DsConfig,
+  route: RouteKind,
+  overrideName?: string,
+): { name: string; prompt: string } {
+  const normalizedOverride = normalizeRoleName(overrideName);
+  if (normalizedOverride) {
+    const prompt = getRolePrompt(config, normalizedOverride);
+    if (prompt) {
+      return { name: normalizedOverride, prompt };
+    }
+  }
+  return resolveRoleForRoute(config, route);
+}
+
 function getDefaultRouteModel(route: RouteKind, providerId: ProviderId): string {
   const provider = PROVIDERS[providerId];
   return provider.model || DEFAULT_CONFIG.providers[providerId].model || "";
@@ -618,6 +650,29 @@ function routeShortLabel(route: RouteKind): string {
   return route === "text" ? "text" : "vision";
 }
 
+function buildDsCliContext(msg: Api.Message): DsCliContext {
+  const command = parseCommandInput(msg);
+  const args = command?.args || [];
+  const cli = parseCliOptions(args, [
+    { name: "think", aliases: ["-t", "--think"], kind: "boolean" },
+    { name: "role", aliases: ["-r", "--role"], kind: "string" },
+    { name: "routeText", aliases: ["-txt", "--text"], kind: "boolean" },
+    { name: "routeVision", aliases: ["-vis", "--vision"], kind: "boolean" },
+  ]);
+  const hasText = cli.options.routeText === true;
+  const hasVision = cli.options.routeVision === true;
+  const positionals = cli.positionals;
+  return {
+    command,
+    cli,
+    args,
+    route: hasText ? "text" : hasVision ? "vision" : null,
+    mainCommand: ((positionals[0] || "") as string).toLowerCase(),
+    subCommand: ((positionals[1] || "") as string).toLowerCase(),
+    hasRouteConflict: hasText && hasVision,
+  };
+}
+
 function truncatePreview(text: string, maxChars: number): string {
   const trimmed = text.trim();
   if (trimmed.length <= maxChars) return trimmed;
@@ -652,9 +707,12 @@ function buildVisionTextBlock(question: string, caption: string): string {
   return lines.join("\n\n");
 }
 
-function buildMessages(config: DsConfig, context: AskContext): ChatMessage[] {
+function buildMessages(
+  config: DsConfig,
+  context: AskContext,
+  resolvedRole: { name: string; prompt: string },
+): ChatMessage[] {
   const messages: ChatMessage[] = [];
-  const resolvedRole = resolveRoleForRoute(config, context.route);
   if (resolvedRole.prompt) {
     messages.push({ role: "system", content: resolvedRole.prompt });
   }
@@ -843,12 +901,12 @@ async function prepareReplyImage(msg: Api.Message): Promise<PreparedImage | null
   };
 }
 
-async function resolveAskContext(msg: Api.Message, args: string[]): Promise<AskContext> {
-  const parsed = parseCliOptions(args, [
-    { name: "think", aliases: ["-t", "--think"], kind: "boolean" },
-  ]);
+async function resolveAskContext(msg: Api.Message, cli: ParsedCliOptions): Promise<AskContext> {
   const replied = await safeGetReplyMessage(msg);
-  const question = takeWithMarker(parsed.positionals.join(" "), MAX_QUESTION_CHARS, "问题");
+  const question = takeWithMarker(cli.positionals.join(" "), MAX_QUESTION_CHARS, "问题");
+  const roleOverrideName = typeof cli.options.role === "string"
+    ? normalizeRoleName(cli.options.role)
+    : undefined;
 
   if (!replied) {
     if (!question) {
@@ -859,7 +917,8 @@ async function resolveAskContext(msg: Api.Message, args: string[]): Promise<AskC
     return {
       route: "text",
       question,
-      thinkEnabled: parsed.options.think === true,
+      thinkEnabled: cli.options.think === true,
+      roleOverrideName,
     };
   }
 
@@ -876,10 +935,10 @@ async function resolveAskContext(msg: Api.Message, args: string[]): Promise<AskC
       question,
       caption,
       image,
-      thinkEnabled: parsed.options.think === true,
+      thinkEnabled: cli.options.think === true,
+      roleOverrideName,
     };
   }
-
   const repliedText = (replied.message || "").trim();
   if (!repliedText && !question) {
     throw new Error(
@@ -893,7 +952,8 @@ async function resolveAskContext(msg: Api.Message, args: string[]): Promise<AskC
     route: "text",
     question,
     repliedText,
-    thinkEnabled: parsed.options.think === true,
+    thinkEnabled: cli.options.think === true,
+    roleOverrideName,
   };
 }
 
@@ -1125,26 +1185,32 @@ class DsPlugin extends Plugin {
           lines: [
             `<code>${mainPrefix}ds [问题]</code> - 直接提问`,
             `<code>${mainPrefix}ds -t [问题]</code> - 显式开启 think 后提问`,
+            `<code>${mainPrefix}ds -r &lt;role&gt; [问题]</code> - 本次请求临时使用指定 role`,
             `<code>${mainPrefix}ds</code> - 回复文本继续对话，或回复单张静态图片做识别`,
             `<code>${mainPrefix}ds -t</code> - 回复消息时显式开启 think`,
+            `<code>${mainPrefix}ds -r &lt;role&gt;</code> - 回复消息时临时使用指定 role`,
             `<code>${mainPrefix}ds 这是什么</code> - 回复图片并提问`,
           ],
         },
         {
           heading: "⚙️ 配置命令：",
           lines: [
-            `<code>${mainPrefix}ds text use &lt;provider&gt;</code> - 配置文本路由`,
-            `<code>${mainPrefix}ds vision use &lt;provider&gt;</code> - 配置多模态路由`,
+            `<code>${mainPrefix}ds -txt use &lt;provider&gt;</code> - 配置文本路由`,
+            `<code>${mainPrefix}ds -vis use &lt;provider&gt;</code> - 配置多模态路由`,
+            `<code>${mainPrefix}ds use -txt &lt;provider&gt;</code> - 配置文本路由`,
+            `<code>${mainPrefix}ds use -vis &lt;provider&gt;</code> - 配置多模态路由`,
             `<code>${mainPrefix}ds key &lt;provider&gt; &lt;apiKey&gt;</code> - 设置 API Key`,
             `<code>${mainPrefix}ds model set &lt;provider&gt; &lt;model&gt;</code> - 设置 provider 的单模型`,
             `<code>${mainPrefix}ds models set &lt;provider&gt; &lt;m1,m2,m3&gt;</code> - 设置 provider 的轮询模型池`,
             `<code>${mainPrefix}ds role list</code> - 查看全部 system role`,
-            `<code>${mainPrefix}ds role use text|vision &lt;name&gt;</code> - 切换路由 role`,
+            `<code>${mainPrefix}ds role use -txt|--text &lt;name&gt;</code> - 切换文本路由 role`,
+            `<code>${mainPrefix}ds role use -vis|--vision &lt;name&gt;</code> - 切换多模态路由 role`,
             `<code>${mainPrefix}ds role add &lt;name&gt;</code> - 回复一条消息，创建自定义 role`,
             `<code>${mainPrefix}ds role update &lt;name&gt;</code> - 回复一条消息，覆盖自定义 role`,
             `<code>${mainPrefix}ds role del &lt;name&gt;</code> - 删除自定义 role`,
             `<code>${mainPrefix}ds role show &lt;name&gt;</code> - 查看 role 内容`,
-            `<code>${mainPrefix}ds role reset text|vision</code> - 路由 role 重置为 default`,
+            `<code>${mainPrefix}ds role reset -txt|--text</code> - 文本路由 role 重置为 default`,
+            `<code>${mainPrefix}ds role reset -vis|--vision</code> - 多模态路由 role 重置为 default`,
             `<code>${mainPrefix}ds status</code> - 查看当前配置`,
           ],
         },
@@ -1164,48 +1230,48 @@ class DsPlugin extends Plugin {
   }
 
   private async handleDs(msg: Api.Message): Promise<void> {
-    const parsed = parseCommandInput(msg);
-    const payload = parsed?.body || "";
-    const args = parsed?.args || [];
-    const [first = "", second = "", third = ""] = args;
-    const lowerFirst = first.toLowerCase();
-    const lowerSecond = second.toLowerCase();
-    const lowerThird = third.toLowerCase();
+    const context = buildDsCliContext(msg);
+    const positionals = context.cli.positionals;
 
-    if (lowerFirst === "help") {
+    if (context.hasRouteConflict) {
+      await safeEditMessage(
+        msg,
+        `❌ 不能同时指定 <code>-txt</code>/<code>--text</code> 和 <code>-vis</code>/<code>--vision</code>。`,
+        "html",
+      );
+      return;
+    }
+
+    if (context.mainCommand === "help") {
       await this.handleHelp(msg);
       return;
     }
-    if (lowerFirst === "status") {
+    if (context.mainCommand === "status") {
       await this.handleStatus(msg);
       return;
     }
-    if (lowerFirst === "key") {
-      await this.handleKey(msg);
+    if (context.mainCommand === "key") {
+      await this.handleKey(msg, positionals);
       return;
     }
-    if (lowerFirst === "role") {
-      await this.handleRole(msg);
+    if (context.mainCommand === "role") {
+      await this.handleRole(msg, context);
       return;
     }
-    if (lowerFirst === "model" && lowerSecond === "set") {
-      await this.handleModelSet(msg);
+    if (context.mainCommand === "model" && context.subCommand === "set") {
+      await this.handleModelSet(msg, positionals);
       return;
     }
-    if (lowerFirst === "models" && lowerSecond === "set") {
-      await this.handleModelsSet(msg);
+    if (context.mainCommand === "models" && context.subCommand === "set") {
+      await this.handleModelsSet(msg, positionals);
       return;
     }
-    if (lowerFirst === "text" && lowerSecond === "use") {
-      await this.handleRouteUse(msg, "text", lowerThird);
-      return;
-    }
-    if (lowerFirst === "vision" && lowerSecond === "use") {
-      await this.handleRouteUse(msg, "vision", lowerThird);
+    if (context.route && context.mainCommand === "use") {
+      await this.handleRouteUse(msg, context.route, positionals[1] || "");
       return;
     }
 
-    await this.handleAsk(msg);
+    await this.handleAsk(msg, context);
   }
 
   private async handleHelp(msg: Api.Message): Promise<void> {
@@ -1242,9 +1308,7 @@ class DsPlugin extends Plugin {
     await safeEditMessage(msg, lines.join("\n"), "html");
   }
 
-  private async handleKey(msg: Api.Message): Promise<void> {
-    const parsed = parseCommandInput(msg);
-    const args = parsed?.args || [];
+  private async handleKey(msg: Api.Message, args: string[]): Promise<void> {
     const providerId = normalizeProviderId(args[1]);
     const apiKey = args.slice(2).join(" ").trim();
 
@@ -1266,44 +1330,42 @@ class DsPlugin extends Plugin {
     );
   }
 
-  private async handleRole(msg: Api.Message): Promise<void> {
-    const parsed = parseCommandInput(msg);
-    const parts = parsed?.args || [];
-    const subcommand = parts[1]?.toLowerCase() || "list";
+  private async handleRole(msg: Api.Message, context: DsCliContext): Promise<void> {
+    const parts = context.cli.positionals;
 
-    if (subcommand === "list" || subcommand === "ls") {
+    if (context.subCommand === "list" || context.subCommand === "ls") {
       await this.handleRoleList(msg);
       return;
     }
-    if (subcommand === "show") {
+    if (context.subCommand === "show") {
       await this.handleRoleShow(msg, parts[2] || "");
       return;
     }
-    if (subcommand === "use") {
-      await this.handleRoleUse(msg, parts[2] || "", parts[3] || "");
+    if (context.subCommand === "use") {
+      await this.handleRoleUse(msg, context.route, parts[2] || "");
       return;
     }
-    if (subcommand === "add") {
+    if (context.subCommand === "add") {
       await this.handleRoleAdd(msg, parts[2] || "");
       return;
     }
-    if (subcommand === "update") {
+    if (context.subCommand === "update") {
       await this.handleRoleUpdate(msg, parts[2] || "");
       return;
     }
-    if (subcommand === "del" || subcommand === "delete" || subcommand === "rm") {
+    if (context.subCommand === "del" || context.subCommand === "delete" || context.subCommand === "rm") {
       await this.handleRoleDelete(msg, parts[2] || "");
       return;
     }
-    if (subcommand === "reset") {
-      await this.handleRoleReset(msg, parts[2] || "");
+    if (context.subCommand === "reset") {
+      await this.handleRoleReset(msg, context.route);
       return;
     }
 
     await safeEditMessage(
       msg,
-      `未知 role 子命令：<code>${escapeHtml(subcommand)}</code>\n` +
-        `用法：<code>${escapeHtml(mainPrefix)}ds role list</code> / <code>${escapeHtml(mainPrefix)}ds role use text|vision &lt;name&gt;</code>`,
+      `未知 role 子命令：<code>${escapeHtml(context.subCommand || "(空)")}</code>\n` +
+        `用法：<code>${escapeHtml(mainPrefix)}ds role list</code> / <code>${escapeHtml(mainPrefix)}ds role use -txt|--text &lt;name&gt;</code>`,
       "html",
     );
   }
@@ -1374,17 +1436,17 @@ class DsPlugin extends Plugin {
 
   private async handleRoleUse(
     msg: Api.Message,
-    rawRoute: string,
+    route: RouteKind | null,
     rawRoleName: string,
   ): Promise<void> {
-    const route = rawRoute === "text" || rawRoute === "vision" ? rawRoute : null;
     const roleName = normalizeRoleName(rawRoleName);
     const config = await this.configStore.get();
 
     if (!route || !roleName || !hasRole(config, roleName)) {
       await safeEditMessage(
         msg,
-        `用法：<code>${escapeHtml(mainPrefix)}ds role use text|vision &lt;name&gt;</code>`,
+        `用法：<code>${escapeHtml(mainPrefix)}ds role use -txt|--text &lt;name&gt;</code>\n` +
+          `<code>${escapeHtml(mainPrefix)}ds role use -vis|--vision &lt;name&gt;</code>`,
         "html",
       );
       return;
@@ -1497,12 +1559,12 @@ class DsPlugin extends Plugin {
     );
   }
 
-  private async handleRoleReset(msg: Api.Message, rawRoute: string): Promise<void> {
-    const route = rawRoute === "text" || rawRoute === "vision" ? rawRoute : null;
+  private async handleRoleReset(msg: Api.Message, route: RouteKind | null): Promise<void> {
     if (!route) {
       await safeEditMessage(
         msg,
-        `用法：<code>${escapeHtml(mainPrefix)}ds role reset text|vision</code>`,
+        `用法：<code>${escapeHtml(mainPrefix)}ds role reset -txt|--text</code>\n` +
+          `<code>${escapeHtml(mainPrefix)}ds role reset -vis|--vision</code>`,
         "html",
       );
       return;
@@ -1516,9 +1578,7 @@ class DsPlugin extends Plugin {
     );
   }
 
-  private async handleModelSet(msg: Api.Message): Promise<void> {
-    const parsed = parseCommandInput(msg);
-    const args = parsed?.args || [];
+  private async handleModelSet(msg: Api.Message, args: string[]): Promise<void> {
     const providerId = normalizeProviderId(args[2]);
     const model = args.slice(3).join(" ").trim();
 
@@ -1539,9 +1599,7 @@ class DsPlugin extends Plugin {
     );
   }
 
-  private async handleModelsSet(msg: Api.Message): Promise<void> {
-    const parsed = parseCommandInput(msg);
-    const args = parsed?.args || [];
+  private async handleModelsSet(msg: Api.Message, args: string[]): Promise<void> {
     const providerId = normalizeProviderId(args[2]);
     const rawModels = args.slice(3).join(" ").trim();
     const models = normalizeModelList(rawModels);
@@ -1572,7 +1630,7 @@ class DsPlugin extends Plugin {
     if (!provider) {
       await safeEditMessage(
         msg,
-        `用法：<code>${escapeHtml(mainPrefix)}ds ${route} use &lt;provider&gt;</code>\n` +
+        `用法：<code>${escapeHtml(mainPrefix)}ds use ${route === "text" ? "-txt|--text" : "-vis|--vision"} &lt;provider&gt;</code>\n` +
           `${route} providers: ${formatProviderList(route)}`,
         "html",
       );
@@ -1593,21 +1651,19 @@ class DsPlugin extends Plugin {
     await safeEditMessage(msg, lines.join("\n"), "html");
   }
 
-  private async handleAsk(msg: Api.Message): Promise<void> {
+  private async handleAsk(msg: Api.Message, context: DsCliContext): Promise<void> {
     await safeEditMessage(msg, "🤖 正在整理上下文…");
 
-    let context: AskContext;
+    let askContext: AskContext;
     try {
-      const parsed = parseCommandInput(msg);
-      const args = parsed?.args || [];
-      context = await resolveAskContext(msg, args);
+      askContext = await resolveAskContext(msg, context.cli);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await safeEditMessage(msg, message, message.includes("<code>") ? "html" : undefined);
       return;
     }
 
-    const route = context.route;
+    const route = askContext.route;
     const selection = await this.configStore.selectRouteModel(route);
     const apiKey = selection.config.keys[selection.provider.keyProviderId];
 
@@ -1625,12 +1681,23 @@ class DsPlugin extends Plugin {
       return;
     }
 
-    const messages = buildMessages(selection.config, context);
-    const extraBody = getProviderExtraBody(selection.provider.id, context.thinkEnabled);
+    if (askContext.roleOverrideName && !hasRole(selection.config, askContext.roleOverrideName)) {
+      await safeEditMessage(
+        msg,
+        `❌ 未找到 role <code>${escapeHtml(askContext.roleOverrideName)}</code>。\n` +
+          `请先执行 <code>${escapeHtml(mainPrefix)}ds role list</code> 查看可用 role。`,
+        "html",
+      );
+      return;
+    }
 
-    const thinkingLabel = `🤖 正在使用 ${selection.provider.displayName} (${selection.model})${context.thinkEnabled ? " [think]" : ""}…`;
-    if (context.question) {
-      await safeEditMessage(msg, `💬 ${escapeHtml(context.question)}\n──────────\n${thinkingLabel}`, "html");
+    const resolvedRole = resolveRoleForAsk(selection.config, route, askContext.roleOverrideName);
+    const messages = buildMessages(selection.config, askContext, resolvedRole);
+    const extraBody = getProviderExtraBody(selection.provider.id, askContext.thinkEnabled);
+
+    const thinkingLabel = `🤖 正在使用 ${selection.provider.displayName} (${selection.model})${askContext.thinkEnabled ? " [think]" : ""}…`;
+    if (askContext.question) {
+      await safeEditMessage(msg, `💬 ${escapeHtml(askContext.question)}\n──────────\n${thinkingLabel}`, "html");
     } else {
       await safeEditMessage(msg, thinkingLabel);
     }
@@ -1648,9 +1715,9 @@ class DsPlugin extends Plugin {
         renderAnswer({
           providerName: selection.provider.displayName,
           model: selection.model,
-          reasoning: context.thinkEnabled ? reasoning : undefined,
+          reasoning: askContext.thinkEnabled ? reasoning : undefined,
           answer: combined,
-          question: context.question,
+          question: askContext.question,
         }),
         "html",
       );
@@ -1668,7 +1735,7 @@ class DsPlugin extends Plugin {
             timeout: 120_000,
           },
           (delta: OpenAICompatDelta) => {
-            if (context.thinkEnabled && delta.reasoningContent) {
+            if (askContext.thinkEnabled && delta.reasoningContent) {
               reasoning += delta.reasoningContent;
             }
             if (delta.content) {
@@ -1687,7 +1754,7 @@ class DsPlugin extends Plugin {
           extraBody,
           timeout: 60_000,
         });
-        if (context.thinkEnabled) {
+        if (askContext.thinkEnabled) {
           reasoning = extractCompletionReasoning(response) || "";
         }
         combined = extractCompletionContent(response) || "";
