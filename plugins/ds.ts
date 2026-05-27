@@ -15,8 +15,8 @@ import {
 } from "@utils/openAICompat";
 
 type RouteKind = "text" | "vision";
-type ProviderId = "deepseek" | "siliconflow" | "ark" | "kimi";
-type KeyProviderId = "deepseek" | "siliconflow" | "ark" | "kimi";
+type ProviderId = "deepseek" | "siliconflow" | "ark" | "kimi" | "mimo";
+type KeyProviderId = "deepseek" | "siliconflow" | "ark" | "kimi" | "mimo";
 
 type ProviderDefinition = {
   id: ProviderId;
@@ -178,6 +178,17 @@ const PROVIDERS: Record<ProviderId, ProviderDefinition> = {
     model: "kimi-k2.6",
     description: "Kimi 模型配置",
   },
+  mimo: {
+    id: "mimo",
+    displayName: "MiMo",
+    baseURL: "https://token-plan-cn.xiaomimimo.com/v1",
+    keyProviderId: "mimo",
+    supportsText: true,
+    supportsVision: true,
+    supportsStream: true,
+    model: "mimo-v2.5",
+    description: "MiMo Token Plan 模型配置",
+  },
 };
 
 const DEFAULT_CONFIG: DsConfig = {
@@ -200,6 +211,7 @@ const DEFAULT_CONFIG: DsConfig = {
     siliconflow: "",
     ark: "",
     kimi: "",
+    mimo: "",
   },
   providers: {
     deepseek: {
@@ -216,6 +228,10 @@ const DEFAULT_CONFIG: DsConfig = {
     },
     kimi: {
       model: "kimi-k2.6",
+      models: [],
+    },
+    mimo: {
+      model: "mimo-v2.5",
       models: [],
     },
   },
@@ -299,7 +315,8 @@ function normalizeProviderId(value?: string | null): ProviderId | null {
     normalized === "deepseek" ||
     normalized === "siliconflow" ||
     normalized === "ark" ||
-    normalized === "kimi"
+    normalized === "kimi" ||
+    normalized === "mimo"
   ) {
     return normalized;
   }
@@ -501,12 +518,14 @@ function normalizeConfig(raw?: unknown): DsConfig {
       siliconflow: typeof rawKeys.siliconflow === "string" ? rawKeys.siliconflow.trim() : "",
       ark: typeof rawKeys.ark === "string" ? rawKeys.ark.trim() : "",
       kimi: typeof rawKeys.kimi === "string" ? rawKeys.kimi.trim() : "",
+      mimo: typeof rawKeys.mimo === "string" ? rawKeys.mimo.trim() : "",
     },
     providers: {
       deepseek: normalizeProviderConfig("deepseek", rawProviders.deepseek),
       siliconflow: normalizeProviderConfig("siliconflow", rawProviders.siliconflow),
       ark: normalizeProviderConfig("ark", rawProviders.ark),
       kimi: normalizeProviderConfig("kimi", rawProviders.kimi),
+      mimo: normalizeProviderConfig("mimo", rawProviders.mimo),
     },
     cursors: {
       text: typeof rawCursors.text === "number" && Number.isFinite(rawCursors.text)
@@ -898,7 +917,7 @@ function getProviderExtraBody(
   providerId: ProviderId,
   thinkEnabled: boolean,
 ): Record<string, unknown> | undefined {
-  if (providerId === "kimi" || providerId === "deepseek") {
+  if (providerId === "kimi" || providerId === "deepseek" || providerId === "mimo") {
     return {
       thinking: {
         type: thinkEnabled ? "enabled" : "disabled",
@@ -1246,7 +1265,7 @@ class DsPlugin extends Plugin {
       await safeEditMessage(
         msg,
         `用法：<code>${escapeHtml(mainPrefix)}ds key &lt;provider&gt; &lt;apiKey&gt;</code>\n` +
-          `provider: <code>deepseek</code> / <code>siliconflow</code> / <code>ark</code> / <code>kimi</code>`,
+          `provider: <code>deepseek</code> / <code>siliconflow</code> / <code>ark</code> / <code>kimi</code> / <code>mimo</code>`,
         "html",
       );
       return;
