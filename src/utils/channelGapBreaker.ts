@@ -16,7 +16,10 @@
  * itself is not modified.
  */
 
-import { getGlobalClient } from "./globalClient";
+// Note: this module intentionally does NOT import getGlobalClient — it needs
+// SYNC access to the active runtime's client (see tryGetClient() below), and
+// getGlobalClient() is async. We grab the client via a lazy require() of
+// runtimeManager.tryGetCurrentRuntime() instead.
 
 // --- Configuration -----------------------------------------------------------
 
@@ -296,8 +299,8 @@ function clearChannelStateOnClient(
  */
 function tryGetClient(): any | null {
   try {
-    // getGlobalClient is async, but we need sync access.
-    // Access the runtime's client directly.
+    // Sync access required; getGlobalClient() is async and unsuitable here.
+    // tryGetCurrentRuntime returns the live runtime synchronously when set.
     const { tryGetCurrentRuntime } = require("./runtimeManager") as typeof import("./runtimeManager");
     const runtime = tryGetCurrentRuntime();
     if (runtime?.client) {
@@ -312,7 +315,22 @@ function tryGetClient(): any | null {
 /**
  * Reset the circuit breaker state. Called during runtime reload to
  * start fresh.
+ *
+ * IMPORTANT: breakCount is preserved across reloads. If a channel has been
+ * circuit-broken repeatedly (e.g. a permanently desynced channel), resetting
+ * breakCount would cause the exponential backoff to start over at 6h every
+ * reload — defeating the escalation (6h→12h→24h→48h→72h). By keeping
+ * breakCount, the cooldown stays at the escalated level, keeping log noise
+ * and wasted API calls to a minimum for chronically broken channels.
  */
 export function resetCircuitBreaker(): void {
-  channelFailures.clear();
+  for (const [channelId, record] of channelFailures) {
+    record.timestamps = [];
+    record.brokenAt = null;
+    // breakCount is intentionally preserved
+    // If a channel's breakCount is stale (channel recovered), it only
+    // matters if the channel starts failing again after reload — at which
+    // point the escalated cooldown is correct behavior (the channel has
+    // a history of repeated breaks).
+  }
 }
