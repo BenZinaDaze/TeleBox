@@ -186,7 +186,7 @@ function scheduleTrackedTimeout(
 const editExitMsg = async () => {
   try {
     const data = fs.readFileSync(exitFile, "utf-8");
-    const { messageId, chatId, time } = JSON.parse(data);
+    const { messageId, chatId, time, successText, parseMode } = JSON.parse(data);
     const client = await getGlobalClient();
     if (client) {
       let targetChat: any = chatId;
@@ -195,9 +195,13 @@ const editExitMsg = async () => {
       } catch (innerE) {
         console.error("Failed to resolve entity for exit message:", innerE);
       }
+      const elapsedMs = Date.now() - time;
+      const tmpl: string = successText || "✅ 重启完成，耗时 {elapsedMs}ms";
+      const text = tmpl.replace(/\{elapsedMs\}/g, String(elapsedMs));
       await client.editMessage(targetChat, {
         message: messageId,
-        text: `✅ 重启完成，耗时 ${Date.now() - time}ms`,
+        text,
+        ...(parseMode ? { parseMode } : {}),
       });
       fs.unlinkSync(exitFile);
     }
@@ -210,8 +214,19 @@ if (fs.existsSync(exitFile)) {
   editExitMsg();
 }
 
-async function executeExit(msg: Api.Message) {
-  const result = await msg.edit({ text: "🔄 正在结束进程..." });
+export async function executeExit(
+  msg: Api.Message,
+  options?: {
+    pendingText?: string;
+    successText?: string;
+    parseMode?: "html" | "markdown";
+  }
+) {
+  const pendingText = options?.pendingText ?? "🔄 正在结束进程...";
+  const result = await msg.edit({
+    text: pendingText,
+    ...(options?.parseMode ? { parseMode: options.parseMode } : {}),
+  });
   if (result) {
     fs.writeFileSync(
       exitFile,
@@ -219,6 +234,8 @@ async function executeExit(msg: Api.Message) {
         messageId: result.id,
         chatId: result.chatId || result.peerId,
         time: Date.now(),
+        successText: options?.successText,
+        parseMode: options?.parseMode,
       }),
       "utf-8"
     );
@@ -421,7 +438,7 @@ class ReloadPlugin extends Plugin {
         const startTime = Date.now();
         const runtime = await reloadRuntime();
         const loadTime = Date.now() - startTime;
-        const timeText = loadTime > 1000 ? `${(loadTime / 1000).toFixed(2)}s` : `${loadTime}ms`;
+        const timeText = `${loadTime}ms`;
         const configDB = await initConfig();
         const afterMemory = getMemoryUsage();
 
